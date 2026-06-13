@@ -1777,7 +1777,8 @@ async function proxyChatRequest(res, payload, requestedModel, writeError, writeU
   const requestedStream = payload.stream === true;
 
   if (session.requestCount === 1) {
-    console.log(`${reqStart} [Session#${sessNum}>${slot.name}]-[${requestedModel}]-first-prompt-body: ${JSON.stringify(payload)}`);
+    const firstPrompt = extractUserPrompt(payload);
+    console.log(`${reqStart} [Session#${sessNum}>${slot.name}]-[${requestedModel}]-first-prompt: ${firstPrompt}`);
   }
 
   if (!skipLabel) stampSessionLabel(payload, slot.name, sessNum);
@@ -2572,6 +2573,16 @@ function setupOpencodeConfig() {
       }
       if (!existing.provider || typeof existing.provider !== 'object') existing.provider = {};
       existing.provider['umans'] = providerEntry;
+
+      // Ensure project guidance is loaded so opencode follows UMANS-Proxy conventions
+      // (e.g. exact edit matching, using webfetch instead of websearch, etc.)
+      if (!Array.isArray(existing.instructions)) existing.instructions = [];
+      for (const guidance of ['AGENTS.md', 'skills.md']) {
+        if (!existing.instructions.includes(guidance)) {
+          existing.instructions.push(guidance);
+        }
+      }
+
       fs.writeFileSync(configFile, JSON.stringify(existing, null, 2));
       console.log(`[Opencode] Config updated: ${configFile} (${Object.keys(models).length} models)`);
     } catch (e) {
