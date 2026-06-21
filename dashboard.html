@@ -411,6 +411,7 @@
     }
 
     let proxyData = null, config = {}, enabledModels = [], allModels = [], allDisplayNames = {}, blurTokensEnabled = false, editingIdx = -1, umansLoggedIn = false, umansEmail = '', umansUserId = '';
+    let disabledModels = new Set();
     let wallpaperLoaded = false;
     const DEFAULT_FREEGEN_PROMPT = 'A breathtaking sci-fi landscape with glowing neon structures floating above a misty alien ocean, cinematic lighting, 8K, hyper-detailed, ethereal atmosphere, 16:9 wallpaper';
     let usageDays = [], usagePage = 0, usagePerPage = 10;
@@ -684,13 +685,35 @@
         updateTestChatModels();
         return;
       }
-      badge.textContent = enabledModels.length;
+      const enabledCount = enabledModels.filter(m => !disabledModels.has(m)).length;
+      badge.textContent = enabledCount;
       container.innerHTML = `<div style="display:flex;flex-wrap:wrap;gap:1px">${enabledModels.map((model, idx) => {
         const display = allDisplayNames[model] || model.replace(/^umans-/i, '');
-        return `<div class="model-tag enabled" title="${escapeHtml(model)}"><input type="checkbox" checked><div class="model-tag-row"><span class="model-tag-id">${escapeHtml(display)}</span></div></div>`;
+        const isDisabled = disabledModels.has(model);
+        const cls = isDisabled ? 'model-tag' : 'model-tag enabled';
+        const checked = isDisabled ? '' : 'checked';
+        return `<div class="${cls}" title="${escapeHtml(model)}" onclick="toggleModel('${escapeHtml(model).replace(/'/g,"\\'")}')"><input type="checkbox" ${checked}><div class="model-tag-row"><span class="model-tag-id">${escapeHtml(display)}</span></div></div>`;
       }).join('')}</div>`;
       setTestChatVisible(true);
       updateTestChatModels();
+    }
+
+    async function toggleModel(modelId) {
+      if (disabledModels.has(modelId)) {
+        disabledModels.delete(modelId);
+      } else {
+        disabledModels.add(modelId);
+      }
+      renderModels();
+      try {
+        const r = await fetch('/api/config', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ disabledModels: Array.from(disabledModels) })
+        });
+        const d = await r.json();
+        if (!d.success) showToast(t('toast_failed_prefix','Failed:') + ' ' + (d.error||''), 'danger');
+      } catch { showToast(t('toast_failed_prefix','Failed:'), 'danger'); }
     }
 
     async function fetchUmansUserStatus() {
@@ -767,6 +790,7 @@
         ]);
         proxyData=await hr.json(); const cd=await cr.json(); const md=await mr.json();
         enabledModels = md.models||[];
+        disabledModels = new Set(md.disabled_models || []);
         allModels = enabledModels; // aliases for backward compatibility
         allDisplayNames = md.model_display_names||{};
         if(cd) {
@@ -1005,7 +1029,7 @@ container.innerHTML = `<div style="width:100%;font-size:11px;white-space:nowrap"
       const sel = document.getElementById('testChatModelSelect');
       const current = sel.value;
       sel.innerHTML = '';
-      const all = enabledModels || [];
+      const all = (enabledModels || []).filter(m => !disabledModels.has(m));
       if (!all.length) {
         sel.innerHTML = '<option value="">' + escapeHtml(t('models_none','No enabled models')) + '</option>';
         return;
@@ -1054,17 +1078,19 @@ container.innerHTML = `<div style="width:100%;font-size:11px;white-space:nowrap"
       const scroll = document.getElementById('testChatScroll');
       scroll.scrollTop = scroll.scrollHeight;
 
+      const anthropicMessages = ctxOn ? [...testChatHistory.map(h => ({ role: h.role, content: h.content })), { role: 'user', content: msg }] : [{ role: 'user', content: msg }];
       const body = {
         model,
-        messages: ctxOn ? [...testChatHistory, { role: 'user', content: msg }] : [{ role: 'user', content: msg }],
+        max_tokens: 4096,
+        messages: anthropicMessages,
         stream: streamOn,
       };
 
       testChatAbort = new AbortController();
       try {
-        const resp = await fetch('/v1/chat/completions', {
+        const resp = await fetch('/v1/messages', {
           method: 'POST',
-          headers: { 'Content-Type': 'application/json', 'x-umans-proxy-skip-label': '1' },
+          headers: { 'Content-Type': 'application/json', 'x-api-key': 'dashboard', 'anthropic-version': '2023-06-01', 'x-umans-proxy-skip-label': '1' },
           body: JSON.stringify(body),
           signal: testChatAbort.signal,
         });
@@ -1084,8 +1110,8 @@ container.innerHTML = `<div style="width:100%;font-size:11px;white-space:nowrap"
           scroll.scrollTop = scroll.scrollHeight;
 
           let fullContent = '';
-          let thinkTagOpen = false;
           let buffer = '';
+          let currentEvent = '';
 
           while (true) {
             let done, value;
@@ -1100,17 +1126,14 @@ container.innerHTML = `<div style="width:100%;font-size:11px;white-space:nowrap"
             const lines = buffer.split('\n');
             buffer = lines.pop() || '';
             for (const line of lines) {
-              if (line.startsWith('data: ')) {
-                const data = line.slice(6).trim();
-                if (data === '[DONE]') continue;
+              if (line.startsWith('event: ')) {
+                currentEvent = line.slice(7).trim();
+              } else if (line.startsWith('data: ') && currentEvent === 'content_block_delta') {
                 try {
-                  const parsed = JSON.parse(data);
-                  const delta = parsed.choices?.[0]?.delta?.content || '';
-                  if (!delta) continue;
-                  for (const ch of delta) {
-                    if (ch === '<' && !thinkTagOpen) { thinkTagOpen = true; continue; }
-                    if (thinkTagOpen) { if (ch === '>') thinkTagOpen = false; continue; }
-                    fullContent += ch;
+                  const parsed = JSON.parse(line.slice(6).trim());
+                  const delta = parsed.delta;
+                  if (delta?.type === 'text_delta' && delta.text) {
+                    fullContent += delta.text;
                     asstDiv.querySelector('.test-chat-msg-content').textContent = fullContent;
                     scroll.scrollTop = scroll.scrollHeight;
                     await new Promise(r => setTimeout(r, 5));
@@ -1141,8 +1164,8 @@ container.innerHTML = `<div style="width:100%;font-size:11px;white-space:nowrap"
             pairs.appendChild(errDiv);
           } else {
             const data = await resp.json();
-            const msgData = data.choices?.[0]?.message || {};
-            let content = (msgData.content || '').replace(/<think>[\s\S]*?<\/think>/gi, '').replace(/^\s+|\s+$/g, '') || '(empty response)';
+            const textBlocks = (data.content || []).filter(b => b.type === 'text');
+            let content = textBlocks.map(b => b.text || '').join('\n').replace(/^\s+|\s+$/g, '') || '(empty response)';
             const dn = getModelDisplayName(model);
             const asstDiv = document.createElement('div');
             asstDiv.className = 'test-chat-msg assistant';

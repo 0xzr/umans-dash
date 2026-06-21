@@ -286,6 +286,22 @@ function sanitizeSseResponse(text) {
   return serializeSseEvents(outEvents);
 }
 
+// ── Anthropic error helpers ───────────────────────────────────────────────
+
+function writeAnthropicError(res, statusCode, message, errorType) {
+  if (!message) message = http.STATUS_CODES[statusCode] || 'Unknown error';
+  const typeMap = { 400: 'invalid_request_error', 401: 'authentication_error', 403: 'permission_error', 404: 'not_found_error', 429: 'rate_limit_error', 500: 'api_error', 503: 'overloaded_error' };
+  writeJSON(res, statusCode, { type: 'error', error: { type: errorType || typeMap[statusCode] || 'api_error', message } });
+}
+
+function writeAnthropicPassthroughError(res, statusCode, body) {
+  const trimmed = (body || '').trim();
+  let message = trimmed;
+  let errorType = 'api_error';
+  try { const p = JSON.parse(trimmed); message = p.error?.message || p.message || trimmed; errorType = p.error?.type || 'api_error'; } catch {}
+  writeJSON(res, statusCode, { type: 'error', error: { type: errorType, message } });
+}
+
 let activeRequests = 0;
 let requestQueue = [];
 
@@ -311,9 +327,16 @@ function getOrderedModelIds() {
 function getEffectiveModels() {
   // Use all UMANS catalog models as the authoritative model list.
   const catalogIds = getOrderedModelIds();
-  if (catalogIds.length > 0) return catalogIds;
-  // Fallback to legacy enabledModels only when catalog is empty.
-  return config?.enabledModels || [];
+  const all = catalogIds.length > 0 ? catalogIds : (config?.enabledModels || []);
+  const disabled = config?.disabledModels;
+  if (!disabled || disabled.length === 0) return all;
+  const disabledSet = new Set(disabled);
+  return all.filter(m => !disabledSet.has(m));
+}
+
+function getAllCatalogModels() {
+  const catalogIds = getOrderedModelIds();
+  return catalogIds.length > 0 ? catalogIds : (config?.enabledModels || []);
 }
 
 let modelsDevCache = null;
@@ -473,6 +496,7 @@ function loadConfig() {
     freegenPrompt: rawConfig.FREEGEN_PROMPT || 'epic cinematic landscape, mountains at sunset, vibrant colors, ultra detailed, 16:9 wallpaper',
     overrideConcurrency: Math.max(0, rawConfig.OVERRIDE_CONCURRENCY || 0),
     maxImages: Math.max(1, rawConfig.MAX_IMAGES || 9),
+    disabledModels: Array.isArray(rawConfig.DISABLED_MODELS) ? rawConfig.DISABLED_MODELS : [],
     locale: rawConfig.LOCALE || null,
   };
 }
@@ -520,6 +544,8 @@ function saveConfig(cfg) {
     wallpaperSource: cfg.wallpaperSource || 'freegen',
     FREEGEN_PROMPT: cfg.freegenPrompt || 'epic cinematic landscape, mountains at sunset, vibrant colors, ultra detailed, 16:9 wallpaper',
     OVERRIDE_CONCURRENCY: cfg.overrideConcurrency || 0,
+    MAX_IMAGES: cfg.maxImages || 9,
+    DISABLED_MODELS: cfg.disabledModels || [],
     LOCALE: cfg.locale || null,
   }, null, 2));
 }
@@ -1466,6 +1492,16 @@ class UpstreamClient {
     };
   }
 
+  anthropicHeaders(stream = false) {
+    return {
+      'x-api-key': this.apiKey,
+      'anthropic-version': '2023-06-01',
+      'Content-Type': 'application/json',
+      'Accept': stream ? 'text/event-stream' : 'application/json',
+      'Connection': 'keep-alive',
+    };
+  }
+
   async getUserInfo() {
     const requestURL = `${this.baseURL}/models/info`;
     const resp = await fetch(requestURL, {
@@ -1480,6 +1516,21 @@ class UpstreamClient {
 
   async chatCompletions(body) {
     const requestURL = `${this.baseURL}/chat/completions`;
+    const isStream = body && body.stream === true;
+    const resp = await fetch(requestURL, {
+      method: 'POST',
+      headers: this.headers(isStream),
+      body: JSON.stringify(body),
+      signal: AbortSignal.timeout(this.timeout),
+      agent: UPSTREAM_AGENT,
+    });
+    const responseHeaders = {};
+    resp.headers.forEach((v, k) => responseHeaders[k] = v);
+    return { status: resp.status, headers: responseHeaders, body: resp.body };
+  }
+
+  async messages(body) {
+    const requestURL = `${this.baseURL}/messages`;
     const isStream = body && body.stream === true;
     const resp = await fetch(requestURL, {
       method: 'POST',
@@ -2070,8 +2121,13 @@ function processQueue() {
     const item = requestQueue.shift();
     if (item.res.writableEnded) continue;
     activeRequests++;
-    proxyChatRequest(item.res, item.payload, item.model, item.writeError, item.writePassthroughError, item.skipLabel, item.req)
-      .finally(() => { activeRequests--; processQueue(); });
+    if (item.format === 'anthropic') {
+      proxyAnthropicRequest(item.res, item.payload, item.model, item.writeError, item.writePassthroughError, item.skipLabel, item.req)
+        .finally(() => { activeRequests--; processQueue(); });
+    } else {
+      proxyChatRequest(item.res, item.payload, item.model, item.writeError, item.writePassthroughError, item.skipLabel, item.req)
+        .finally(() => { activeRequests--; processQueue(); });
+    }
   }
 }
 
@@ -2092,6 +2148,75 @@ async function handleChatCompletions(req, res) {
   }
   activeRequests++;
   proxyChatRequest(res, payload, requestedModel, writeOpenAIError, writePassthroughError, skipLabel, req)
+    .finally(() => { activeRequests--; processQueue(); });
+}
+
+async function proxyAnthropicRequest(res, payload, requestedModel, writeError, writePassthroughError, skipLabel, req) {
+  const reqStart = Date.now();
+  const isStream = payload.stream === true;
+
+  let slot;
+  slot = await keyPool.acquire();
+  if (!slot) { writeError(res, 503, 'no healthy API keys available', 'server_error', 'no_healthy_keys'); return; }
+
+  const sessNum = ++globalSessionCounter;
+  console.log(`${reqStart} [Session#${sessNum}>${slot.name}]-[anthropic:${requestedModel}]-anthropic-passthrough`);
+
+  try {
+    const result = await upstream.messages(payload);
+    const upstreamBody = result.body;
+    const upstreamStatus = result.status;
+
+    if (upstreamStatus >= 400) {
+      let errText = '';
+      try { errText = await readBodyText(upstreamBody); } catch {}
+      console.log(`${reqStart} [${slot.name}]-[anthropic:${requestedModel}]-UPSTREAM:${upstreamStatus} ${(errText||'').substring(0,200)}`);
+      logHttpError({
+        errorType: 'upstream_http_error',
+        stage: 'anthropic_passthrough',
+        session: { sessNum, slotName: slot.name },
+        request: { method: 'POST', url: `http://localhost${req?.url || '/v1/messages'}`, headers: redactHeaders(req?.headers || {}), body: redactBodyJson(JSON.stringify(payload).substring(0, 2000)) },
+        upstream: { url: `${upstream.baseURL}/messages`, method: 'POST', status: upstreamStatus, body: (errText || '').substring(0, 500) },
+      });
+      writePassthroughError(res, upstreamStatus, errText);
+      if (upstreamStatus === 500 || upstreamStatus === 503 || upstreamStatus === 502) {
+        keyPool.markUnhealthy(slot.index, upstreamStatus);
+      }
+      return;
+    }
+
+    const respHeaders = {
+      'Content-Type': isStream ? 'text/event-stream' : 'application/json',
+      'Cache-Control': 'no-cache',
+      'Connection': 'keep-alive',
+    };
+    res.writeHead(upstreamStatus, respHeaders);
+    pipeBodyToResponse(upstreamBody, res);
+  } catch (e) {
+    console.log(`${reqStart} [${slot.name}]-[anthropic:${requestedModel}]-ERROR ${(e.message||'').substring(0,200)}`);
+    writePassthroughError(res, 502, e.message || 'upstream fetch failed');
+    keyPool.markUnhealthy(slot.index, 502);
+  }
+}
+
+async function handleAnthropicMessages(req, res) {
+  if (req.method !== 'POST') { writeAnthropicError(res, 405, 'method not allowed', 'invalid_request_error'); return; }
+  let requestBody;
+  try { requestBody = await readBody(req); } catch (e) { writeAnthropicError(res, 400, 'failed to read request body', 'invalid_request_error'); return; }
+  let anthropicPayload;
+  try { anthropicPayload = JSON.parse(requestBody); } catch (e) { writeAnthropicError(res, 400, 'request body must be valid JSON', 'invalid_request_error'); return; }
+  const requestedModel = (anthropicPayload.model || '').trim();
+  if (!requestedModel) { writeAnthropicError(res, 400, 'model is required', 'invalid_request_error'); return; }
+  const skipLabel = req.headers['x-umans-proxy-skip-label'] === '1';
+  const isStream = anthropicPayload.stream === true;
+
+  const limit = getEffectiveConcurrency().limit;
+  if (limit !== null && activeRequests >= limit) {
+    requestQueue.push({ res, payload: anthropicPayload, model: requestedModel, writeError: writeAnthropicError, writePassthroughError: writeAnthropicPassthroughError, skipLabel, req, format: 'anthropic' });
+    return;
+  }
+  activeRequests++;
+  proxyAnthropicRequest(res, anthropicPayload, requestedModel, writeAnthropicError, writeAnthropicPassthroughError, skipLabel, req)
     .finally(() => { activeRequests--; processQueue(); });
 }
 
@@ -2151,9 +2276,9 @@ async function proxyChatRequest(res, payload, requestedModel, writeError, writeU
       try {
         let parsed = null;
         try { parsed = JSON.parse(cached); } catch (e) { /* ignore */ }
-        const finalBody = parsed ? JSON.stringify(sanitizeChatCompletionResponse(parsed)) : cached;
+        if (parsed) parsed = sanitizeChatCompletionResponse(parsed);
         res.writeHead(200, { 'Content-Type': 'application/json' });
-        res.end(finalBody);
+        res.end(parsed ? JSON.stringify(parsed) : cached);
       }
       catch (e) { /* ignore */ }
       return;
@@ -2243,9 +2368,7 @@ async function proxyChatRequest(res, payload, requestedModel, writeError, writeU
           if (parsed) parsed = sanitizeChatCompletionResponse(parsed);
           if (requestedStream) {
             res.writeHead(resp.status, { 'Content-Type': 'text/event-stream', 'Cache-Control': 'no-cache', 'Connection': 'keep-alive' });
-            res.end(parsed ? JSON.stringify(parsed) : `data: ${JSON.stringify({ object: 'chat.completion.chunk', choices: [{ index: 0, delta: { content: bodyText }, finish_reason: 'stop' }] })}
-
-`);
+            res.end(parsed ? JSON.stringify(parsed) : `data: ${JSON.stringify({ object: 'chat.completion.chunk', choices: [{ index: 0, delta: { content: bodyText }, finish_reason: 'stop' }] })}\n\n`);
           } else {
             const finalBody = parsed ? JSON.stringify(parsed) : bodyText;
             res.writeHead(resp.status);
@@ -2399,6 +2522,7 @@ async function handleRequest(req, res) {
         maxImages: config.maxImages,
         wallpaperSource: config.wallpaperSource,
         freegenPrompt: config.freegenPrompt || '',
+        disabledModels: config.disabledModels || [],
       };
       writeJSON(res, 200, safeConfig);
       return;
@@ -2419,6 +2543,7 @@ async function handleRequest(req, res) {
         if (typeof newConfig.freegenPrompt === 'string') config.freegenPrompt = newConfig.freegenPrompt;
         if (newConfig.overrideConcurrency !== undefined) config.overrideConcurrency = Math.max(0, newConfig.overrideConcurrency);
         if (typeof newConfig.maxImages !== 'undefined') config.maxImages = Math.max(1, newConfig.maxImages);
+        if (Array.isArray(newConfig.disabledModels)) config.disabledModels = newConfig.disabledModels;
         if (Array.isArray(newConfig.keys)) {
           config.keys = newConfig.keys;
           keyPool = new KeyPool(config.keys.filter(k => k.key));
@@ -2440,7 +2565,7 @@ async function handleRequest(req, res) {
 
   if (pathname === '/api/models' && req.method === 'GET') {
     await getCatalogData();
-    writeJSON(res, 200, { models: getEffectiveModels(), model_display_names: modelDisplayNameMap });
+    writeJSON(res, 200, { models: getAllCatalogModels(), disabled_models: config.disabledModels || [], model_display_names: modelDisplayNameMap });
     return;
   }
 
@@ -2725,6 +2850,7 @@ async function handleRequest(req, res) {
   if (pathname === '/healthz') { await handleHealthz(req, res); return; }
   if (pathname === '/v1/models') { await handleModels(req, res); return; }
   if (pathname === '/v1/chat/completions') { await handleChatCompletions(req, res); return; }
+  if (pathname === '/v1/messages' || pathname === '/messages') { await handleAnthropicMessages(req, res); return; }
 
   res.writeHead(404, { 'Content-Type': 'text/plain' });
   res.end('Not Found');
@@ -2835,13 +2961,12 @@ function setupOpencodeConfig() {
           id: m,
           name: displayName,
           reasoning: reasoningMode,
-          interleaved: { field: 'reasoning_content' },
         };
 
         if (m === 'umans-glm-5.2') {
           entry.variants = {
-            high: { reasoningEffort: 'high' },
-            max: { reasoningEffort: 'max' },
+            high: { thinking: { type: 'enabled', budgetTokens: 16000 } },
+            max: { thinking: { type: 'enabled', budgetTokens: 32000 } },
           };
         }
 
@@ -2872,9 +2997,12 @@ function setupOpencodeConfig() {
         models[m] = entry;
       }
       const providerEntry = {
-        npm: '@ai-sdk/openai-compatible',
+        npm: '@ai-sdk/anthropic',
         name: 'Umans.AI-Proxy',
-        options: { baseURL: `http://localhost:${port}/v1` },
+        options: {
+          baseURL: `http://localhost:${port}`,
+          apiKey: config.apiKeys && config.apiKeys.length > 0 ? config.apiKeys[0] : 'umans-proxy',
+        },
         models,
       };
 

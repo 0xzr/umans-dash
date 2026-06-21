@@ -67,6 +67,14 @@ Applies to:
 - Streaming SSE responses (buffered and re-emitted)
 - Cached responses on cache hit
 
+### 3b. Anthropic Messages API Pass-Through (proxy.js:2420-2460)
+
+The proxy exposes `/v1/messages` for Anthropic-compatible clients (e.g., opencode with `@ai-sdk/anthropic`). Since the upstream UMANS API already natively supports Anthropic format at `/v1/messages`, the proxy **passes through** requests directly without translation:
+
+- `proxyAnthropicRequest()` — Acquires a key from the pool, forwards the Anthropic request body to `upstream.messages()`, and pipes the response directly back to the client.
+- No shell-tool guard or cache for Anthropic pass-through (upstream handles these).
+- Concurrency queue supports Anthropic requests alongside OpenAI requests.
+
 ### 4. Retry Logic (proxy.js:79-88, 1822-1916)
 
 `retryLoop(fn)` retries the upstream `/v1/chat/completions` request up to `MAX_RETRIES` times with escalating delays (`3s, 6s, 9s…`).
@@ -153,11 +161,12 @@ Normalizes JSON Schema in tools to handle `$ref`, `$defs`, `definitions`, nullab
 | `/healthz` | GET | Health check |
 | `/v1/models` | GET | OpenAI-format models |
 | `/v1/chat/completions` | POST | OpenAI chat (concurrency-queued) |
+| `/v1/messages` | POST | Anthropic Messages API (pass-through to upstream) |
 
 ### 13. Opencode Config Discovery & Setup (proxy.js:1343-1412)
 
 - `discoverOpencodeConfigs()` — Native filesystem discovery on Windows: scans `C:\Users` for directories and checks each for `.opencode/opencode.json` and `.config/opencode/opencode.json`, plus the `systemprofile` variant. Falls back to `~/.config/opencode/` and `~/.opencode/`. Non-Windows: returns existing parent dirs of the two fallback paths.
-- `setupOpencodeConfig()` — Writes ALL models from `modelDisplayNameMap` to every discovered `opencode.json`. Falls back to `config.enabledModels` if map is empty. Creates `openconfig.b4umans.json` backup before first edit. Provider key: `umans`, uses `@ai-sdk/openai-compatible`. Each model gets `id`, `name`, `reasoning: true`, `interleaved: true`.
+- `setupOpencodeConfig()` — Writes ALL models from `modelDisplayNameMap` to every discovered `opencode.json`. Falls back to `config.enabledModels` if map is empty. Creates `openconfig.b4umans.json` backup before first edit. Provider key: `umans`, uses `@ai-sdk/anthropic`. Each model gets `id`, `name`, `reasoning: true`, `interleaved: true`.
 
 ### 14. Usage Tracking & App Auth (proxy.js:201-319)
 
