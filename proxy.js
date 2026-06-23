@@ -1777,6 +1777,37 @@ function resolveReasoningMode(devEntry, reasoningCaps) {
   return true;
 }
 
+// Map a UMANS reasoning level to a thinking budget (tokens). These are
+// conservative caps that work well with the UMANS upstream; the upstream
+// ultimately decides how much reasoning to emit.
+const REASONING_LEVEL_BUDGETS = {
+  low: 8000,
+  medium: 16000,
+  high: 16000,
+  max: 32000,
+};
+
+// Build opencode variants from the UMANS reasoning levels list.
+// Only levels that actually appear in `levels` become variants, so the
+// opencode dropdown only shows reasoning modes the model supports.
+// "none" is intentionally not a variant — selecting it would disable
+// reasoning, which the base (non-variant) entry already represents.
+function buildReasoningVariants(reasoningCaps) {
+  if (!reasoningCaps || reasoningCaps.supported !== true) return null;
+  if (reasoningCaps.can_disable === false) return null;
+  const levels = parseLevels(reasoningCaps.levels);
+  const variants = {};
+  let added = false;
+  for (const lvl of levels) {
+    if (lvl === 'none') continue;
+    const budget = REASONING_LEVEL_BUDGETS[lvl];
+    if (!budget) continue;
+    variants[lvl] = { thinking: { type: 'enabled', budgetTokens: budget } };
+    added = true;
+  }
+  return added ? variants : null;
+}
+
 function cloneObj(obj) {
   return JSON.parse(JSON.stringify(obj));
 }
@@ -3050,12 +3081,8 @@ function setupOpencodeConfig() {
           reasoning: reasoningMode,
         };
 
-        if (m === 'umans-glm-5.2') {
-          entry.variants = {
-            high: { thinking: { type: 'enabled', budgetTokens: 16000 } },
-            max: { thinking: { type: 'enabled', budgetTokens: 32000 } },
-          };
-        }
+        const variants = buildReasoningVariants(caps.reasoning);
+        if (variants) entry.variants = variants;
 
         if (typeof caps.context_window === 'number' && caps.context_window > 0) {
           let outputLimit = caps.context_window;
