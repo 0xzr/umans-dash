@@ -30,7 +30,7 @@ UMANS-PROXY/
 - `APP_BASE` — `https://app.umans.ai`
 - `IS_BUN` — Detected at runtime (`typeof Bun !== 'undefined'`)
 - `RUNTIME_VERSION` — Bun or Node version string
-- `loadConfig()` — Loads `.config/config.json` with env var overrides (`LISTEN_ADDR`, `UPSTREAM_BASE_URL`, `REQUEST_TIMEOUT`, `UMANS_API_KEY`, `API_KEYS`, `CACHE_TTL`, `CACHE_MAX_SIZE`, `CACHE_ENABLED`, `OVERRIDE_CONCURRENCY`, `FREEGEN_PROMPT`, `MAX_IMAGES`)
+- `loadConfig()` — Loads `.config/config.json` with env var overrides (`LISTEN_ADDR`, `UPSTREAM_BASE_URL`, `REQUEST_TIMEOUT`, `UMANS_API_KEY`, `API_KEYS`, `CACHE_TTL`, `CACHE_MAX_SIZE`, `CACHE_ENABLED`, `OVERRIDE_CONCURRENCY`, `FREEGEN_PROMPT`, `MAX_IMAGES`, `VISION_HANDOFF_ENABLED`, `VISION_HANDOFF_MODEL`, `VISION_HANDOFF_PROMPT`)
 - `saveConfig()` / `debouncedSaveConfig()` — Writes config (debounced 500ms)
 - `parseDuration()` — Parses strings like `15m`, `6h`, `30s` to ms
 - `maskToken(key)` — Masks an API key for display as `prefix...suffix`
@@ -73,6 +73,20 @@ The proxy exposes `/v1/messages` for Anthropic-compatible clients (e.g., opencod
 
 - `proxyAnthropicRequest()` — Acquires a key from the pool, forwards the Anthropic request body to `upstream.messages()`, and pipes the response directly back to the client.
 - No shell-tool guard or cache for Anthropic pass-through (upstream handles these).
+- **Vision handoff** is applied before the upstream call: if the resolved model has `supports_vision: "via-handoff"`, images are extracted and sent to the handoff model (default `umans-kimi-k2.7`), then replaced with text descriptions in the payload.
+
+### 3c. Vision Handoff (proxy.js:1555-1680)
+
+Models whose `capabilities.supports_vision === "via-handoff"` (e.g. `umans-glm-5.2`, `umans-glm-5.1`) cannot process images natively. The proxy intercepts these requests and delegates image analysis to a vision-capable handoff model:
+
+1. `needsVisionHandoff(resolvedModel)` — checks `modelInfoMap` for `via-handoff` flag.
+2. `collectImageParts(payload)` — walks `payload.system` and `payload.messages`, collecting image parts in both OpenAI (`image_url`) and Anthropic (`image` with `source.base64`/`source.url`) formats.
+3. `analyzeImageViaHandoff(dataUri, slot, ...)` — makes a non-streaming `chatCompletions` call to the handoff model (default `umans-kimi-k2.7`) with a system analysis prompt + the image.
+4. `performVisionHandoff(payload, resolvedModel, ...)` — replaces each image part in-place with a `{type: "text", text: "[User pasted image]\n<description>"}` block.
+
+**Config keys**: `VISION_HANDOFF_ENABLED` (default `true`), `VISION_HANDOFF_MODEL` (default `umans-kimi-k2.7`), `VISION_HANDOFF_PROMPT` (default built-in analysis prompt when empty).
+
+Applied to both the OpenAI path (`proxyChatRequest`) and the Anthropic path (`proxyAnthropicRequest`) after model resolution and before the upstream call. On the OpenAI path, the handoff runs after the cache check, so cache hits skip the handoff entirely.
 - Concurrency queue supports Anthropic requests alongside OpenAI requests.
 
 ### 4. Retry Logic (proxy.js:79-88, 1822-1916)

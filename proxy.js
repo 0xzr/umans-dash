@@ -498,6 +498,9 @@ function loadConfig() {
     maxImages: Math.max(1, rawConfig.MAX_IMAGES || 9),
     disabledModels: Array.isArray(rawConfig.DISABLED_MODELS) ? rawConfig.DISABLED_MODELS : [],
     locale: rawConfig.LOCALE || null,
+    visionHandoffEnabled: rawConfig.VISION_HANDOFF_ENABLED !== false,
+    visionHandoffModel: rawConfig.VISION_HANDOFF_MODEL || 'umans-kimi-k2.7',
+    visionHandoffPrompt: rawConfig.VISION_HANDOFF_PROMPT || '',
   };
 }
 
@@ -547,6 +550,9 @@ function saveConfig(cfg) {
     MAX_IMAGES: cfg.maxImages || 9,
     DISABLED_MODELS: cfg.disabledModels || [],
     LOCALE: cfg.locale || null,
+    VISION_HANDOFF_ENABLED: cfg.visionHandoffEnabled !== false,
+    VISION_HANDOFF_MODEL: cfg.visionHandoffModel || 'umans-kimi-k2.7',
+    VISION_HANDOFF_PROMPT: cfg.visionHandoffPrompt || '',
   }, null, 2));
 }
 
@@ -1546,6 +1552,160 @@ function limitImagesInMessages(payload, maxImages) {
   }
 }
 
+// ── Vision handoff ──────────────────────────────────────────────────────────
+// Models whose capabilities.supports_vision === "via-handoff" cannot process
+// images natively. The proxy intercepts images in requests to such models,
+// sends each image to a vision-capable handoff model (default: umans-kimi-k2.7),
+// and replaces the image part with the text description returned by the
+// handoff model before forwarding the request to the original model.
+
+const DEFAULT_VISION_HANDOFF_PROMPT = `The user has pasted an image into their chat. Describe what you see as if you are directly observing the image. Be thorough but concise. Include:
+- All visible elements (objects, text, UI elements, people, etc.)
+- Exact transcription of any text
+- The context and purpose of the image
+- Any relevant technical details
+
+Describe it naturally, as if explaining to someone what you're looking at right now.`;
+
+function needsVisionHandoff(resolvedModel) {
+  if (!config.visionHandoffEnabled) return false;
+  const info = modelInfoMap[resolvedModel];
+  if (!info || !info.capabilities) return false;
+  return info.capabilities.supports_vision === 'via-handoff';
+}
+
+// Resolve a requested model ID to its umans- catalog ID.
+function resolveModelId(requestedModel) {
+  if (!requestedModel) return requestedModel;
+  if (requestedModel.startsWith('umans-')) return requestedModel;
+  const prefixed = 'umans-' + requestedModel;
+  const allModels = getEffectiveModels();
+  if (allModels.includes(prefixed)) return prefixed;
+  const direct = allModels.find(m => m === requestedModel);
+  return direct || requestedModel;
+}
+
+// Walk a content array (OpenAI or Anthropic format) and collect image parts.
+function collectImageParts(payload) {
+  const parts = [];
+
+  function walkContentArray(content) {
+    if (!Array.isArray(content)) return;
+    for (let i = 0; i < content.length; i++) {
+      const part = content[i];
+      if (!part || typeof part !== 'object') continue;
+
+      // OpenAI image_url format
+      if (part.type === 'image_url' && part.image_url && part.image_url.url) {
+        parts.push({ container: content, index: i, dataUri: part.image_url.url });
+      }
+      // Anthropic image format
+      else if (part.type === 'image' && part.source) {
+        if (part.source.type === 'base64' && part.source.media_type && part.source.data) {
+          parts.push({ container: content, index: i, dataUri: `data:${part.source.media_type};base64,${part.source.data}` });
+        } else if (part.source.type === 'url' && part.source.url) {
+          parts.push({ container: content, index: i, dataUri: part.source.url });
+        }
+      }
+
+      // Recurse into nested content arrays (e.g. tool_result blocks)
+      if (Array.isArray(part.content)) {
+        walkContentArray(part.content);
+      }
+    }
+  }
+
+  // Anthropic system blocks
+  if (payload && Array.isArray(payload.system)) {
+    walkContentArray(payload.system);
+  }
+
+  // Messages
+  if (payload && Array.isArray(payload.messages)) {
+    for (const m of payload.messages) {
+      if (m && Array.isArray(m.content)) {
+        walkContentArray(m.content);
+      }
+    }
+  }
+
+  return parts;
+}
+
+async function analyzeImageViaHandoff(dataUri, slot, reqStart, sessNum, imageIndex) {
+  const handoffModel = config.visionHandoffModel || 'umans-kimi-k2.7';
+  const prompt = config.visionHandoffPrompt || DEFAULT_VISION_HANDOFF_PROMPT;
+
+  const handoffPayload = {
+    model: handoffModel,
+    stream: false,
+    messages: [
+      { role: 'system', content: prompt },
+      {
+        role: 'user',
+        content: [
+          { type: 'text', text: 'What do you see in this image?' },
+          { type: 'image_url', image_url: { url: dataUri } },
+        ],
+      },
+    ],
+  };
+
+  try {
+    console.log(`${reqStart} [Session#${sessNum}>${slot.name}]-[handoff→${handoffModel}]-analyzing image #${imageIndex + 1}`);
+    const resp = await upstream.chatCompletions(handoffPayload);
+
+    if (resp.status >= 400) {
+      const errText = await readBodyText(resp.body).catch(() => '');
+      console.log(`${reqStart} [Session#${sessNum}>${slot.name}]-[handoff→${handoffModel}]-ERROR:${resp.status} ${(errText || '').substring(0, 200)}`);
+      return `[Image analysis failed: upstream returned HTTP ${resp.status}]`;
+    }
+
+    const bodyText = await readBodyText(resp.body);
+    const parsed = JSON.parse(bodyText);
+    const description = parsed?.choices?.[0]?.message?.content || '';
+
+    if (!description) {
+      return '[Image analysis failed: no text in handoff response]';
+    }
+
+    console.log(`${reqStart} [Session#${sessNum}>${slot.name}]-[handoff→${handoffModel}]-image #${imageIndex + 1} described (${description.length} chars)`);
+    return description;
+  } catch (e) {
+    console.log(`${reqStart} [Session#${sessNum}>${slot.name}]-[handoff→${handoffModel}]-ERROR: ${e.message}`);
+    return `[Image analysis failed: ${e.message}]`;
+  }
+}
+
+// Replace all image parts in the payload with text descriptions from the
+// handoff model. Returns the number of images that were handed off.
+async function performVisionHandoff(payload, resolvedModel, slot, sessNum, reqStart) {
+  if (!needsVisionHandoff(resolvedModel)) return 0;
+
+  const imageParts = collectImageParts(payload);
+  if (imageParts.length === 0) return 0;
+
+  const handoffModel = config.visionHandoffModel || 'umans-kimi-k2.7';
+  console.log(`${reqStart} [Session#${sessNum}>${slot.name}]-[${resolvedModel}]-vision-handoff: ${imageParts.length} image(s) → ${handoffModel}`);
+
+  // Analyze all images in parallel
+  const descriptions = await Promise.all(
+    imageParts.map((ip, i) => analyzeImageViaHandoff(ip.dataUri, slot, reqStart, sessNum, i))
+  );
+
+  // Replace each image part in-place with a text part
+  for (let i = 0; i < imageParts.length; i++) {
+    const { container, index } = imageParts[i];
+    const label = imageParts.length > 1 ? `[User pasted image ${i + 1}]\n` : '[User pasted image]\n';
+    container[index] = {
+      type: 'text',
+      text: label + descriptions[i],
+    };
+  }
+
+  return imageParts.length;
+}
+
 function stampSessionLabel(payload, name, sessNum) {
   const msgs = payload?.messages;
   if (!Array.isArray(msgs)) return;
@@ -2269,12 +2429,44 @@ async function proxyAnthropicRequest(res, payload, requestedModel, writeError, w
   const reqStart = Date.now();
   const isStream = payload.stream === true;
 
+  const fingerprint = fingerprintPayload(payload);
+  const cachedSession = fingerprint != null ? touchConversation(fingerprint) : undefined;
+
   let slot;
-  slot = await keyPool.acquire();
+  if (cachedSession) {
+    slot = await keyPool.acquire(cachedSession.tokenIndex);
+  }
+  if (!slot) {
+    slot = await keyPool.acquire();
+  }
   if (!slot) { writeError(res, 503, 'no healthy API keys available', 'server_error', 'no_healthy_keys'); return; }
 
-  const sessNum = ++globalSessionCounter;
-  console.log(`${reqStart} [Session#${sessNum}>${slot.name}]-[anthropic:${requestedModel}]-anthropic-passthrough`);
+  let session;
+  if (fingerprint != null) {
+    if (!cachedSession) {
+      session = { tokenIndex: slot.index, requestCount: 1, sessNum: ++globalSessionCounter };
+      trackConversationSession(fingerprint, session);
+    } else {
+      session = cachedSession;
+      session.requestCount++;
+      session.tokenIndex = slot.index;
+      trackConversationSession(fingerprint, session);
+    }
+  } else {
+    session = { tokenIndex: slot.index, requestCount: 1, sessNum: ++globalSessionCounter };
+  }
+  const sessNum = session.sessNum;
+
+  if (session.requestCount === 1) {
+    const firstPrompt = extractUserPrompt(payload);
+    console.log(`${reqStart} [Session#${sessNum}>${slot.name}]-[anthropic:${requestedModel}]-first-prompt: ${firstPrompt}`);
+  } else {
+    const promptPreview = extractUserPrompt(payload).substring(0, 80);
+    console.log(`${reqStart} [Session#${sessNum}>${slot.name}]-[anthropic:${requestedModel}]-${promptPreview}`);
+  }
+
+  const resolvedAnthropicModel = resolveModelId(requestedModel);
+  await performVisionHandoff(payload, resolvedAnthropicModel, slot, sessNum, reqStart);
 
   try {
     const result = await upstream.messages(payload);
@@ -2284,7 +2476,7 @@ async function proxyAnthropicRequest(res, payload, requestedModel, writeError, w
     if (upstreamStatus >= 400) {
       let errText = '';
       try { errText = await readBodyText(upstreamBody); } catch {}
-      console.log(`${reqStart} [${slot.name}]-[anthropic:${requestedModel}]-UPSTREAM:${upstreamStatus} ${(errText||'').substring(0,200)}`);
+      console.log(`${reqStart} [Session#${sessNum}>${slot.name}]-[anthropic:${requestedModel}]-UPSTREAM:${upstreamStatus} ${(errText||'').substring(0,200)}`);
       logHttpError({
         errorType: 'upstream_http_error',
         stage: 'anthropic_passthrough',
@@ -2293,7 +2485,13 @@ async function proxyAnthropicRequest(res, payload, requestedModel, writeError, w
         upstream: { url: `${upstream.baseURL}/messages`, method: 'POST', status: upstreamStatus, body: (errText || '').substring(0, 500) },
       });
       writePassthroughError(res, upstreamStatus, errText);
-      if (upstreamStatus === 500 || upstreamStatus === 503 || upstreamStatus === 502) {
+      // The Anthropic pass-through has no retry loop, so marking the key
+      // unhealthy on a 500/502/503 only poisons the key for subsequent
+      // requests with no rotation benefit. A 500 here is almost always a
+      // payload/content issue (e.g. UMANS choking on a large tool history),
+      // not a per-key problem. Only cool down on network-level failures
+      // handled in the catch block below.
+      if (upstreamStatus === 503) {
         keyPool.markUnhealthy(slot.index, upstreamStatus);
       }
       return;
@@ -2307,7 +2505,7 @@ async function proxyAnthropicRequest(res, payload, requestedModel, writeError, w
     res.writeHead(upstreamStatus, respHeaders);
     pipeBodyToResponse(upstreamBody, res);
   } catch (e) {
-    console.log(`${reqStart} [${slot.name}]-[anthropic:${requestedModel}]-ERROR ${(e.message||'').substring(0,200)}`);
+    console.log(`${reqStart} [Session#${sessNum}>${slot.name}]-[anthropic:${requestedModel}]-ERROR ${(e.message||'').substring(0,200)}`);
     writePassthroughError(res, 502, e.message || 'upstream fetch failed');
     keyPool.markUnhealthy(slot.index, 502);
   }
@@ -2406,13 +2604,7 @@ async function proxyChatRequest(res, payload, requestedModel, writeError, writeU
   const promptPreview = extractUserPrompt(payload).substring(0, 80);
   console.log(`${reqStart} [Session#${sessNum}>${slot.name}]-[${requestedModel}]-${promptPreview}`);
 
-  const resolvedModel = requestedModel.startsWith('umans-') ? requestedModel : (() => {
-    const prefixed = 'umans-' + requestedModel;
-    const allModels = getEffectiveModels();
-    if (allModels.includes(prefixed)) return prefixed;
-    const direct = allModels.find(m => m === requestedModel);
-    return direct || requestedModel;
-  })();
+  const resolvedModel = resolveModelId(requestedModel);
   payload.model = resolvedModel;
   if (payload.tools) {
     const needNorm = payload.tools.some(t => t.function?.parameters?.$defs || t.function?.parameters?.$definitions || t.function?.parameters?.$ref);
@@ -2424,6 +2616,8 @@ async function proxyChatRequest(res, payload, requestedModel, writeError, writeU
   if (reasoningCaps?.supported === true && reasoningCaps.can_disable === false) {
     payload.thinking = { type: 'enabled' };
   }
+
+  await performVisionHandoff(payload, resolvedModel, slot, sessNum, reqStart);
 
   await enforceRateLimit(requestedModel);
 
@@ -2641,6 +2835,9 @@ async function handleRequest(req, res) {
         wallpaperSource: config.wallpaperSource,
         freegenPrompt: config.freegenPrompt || '',
         disabledModels: config.disabledModels || [],
+        visionHandoffEnabled: config.visionHandoffEnabled !== false,
+        visionHandoffModel: config.visionHandoffModel || 'umans-kimi-k2.7',
+        visionHandoffPrompt: config.visionHandoffPrompt || '',
       };
       writeJSON(res, 200, safeConfig);
       return;
@@ -2662,6 +2859,9 @@ async function handleRequest(req, res) {
         if (newConfig.overrideConcurrency !== undefined) config.overrideConcurrency = Math.max(0, newConfig.overrideConcurrency);
         if (typeof newConfig.maxImages !== 'undefined') config.maxImages = Math.max(1, newConfig.maxImages);
         if (Array.isArray(newConfig.disabledModels)) config.disabledModels = newConfig.disabledModels;
+        if (typeof newConfig.visionHandoffEnabled === 'boolean') config.visionHandoffEnabled = newConfig.visionHandoffEnabled;
+        if (typeof newConfig.visionHandoffModel === 'string') config.visionHandoffModel = newConfig.visionHandoffModel.trim();
+        if (typeof newConfig.visionHandoffPrompt === 'string') config.visionHandoffPrompt = newConfig.visionHandoffPrompt;
         if (Array.isArray(newConfig.keys)) {
           config.keys = newConfig.keys;
           keyPool = new KeyPool(config.keys.filter(k => k.key));
