@@ -304,6 +304,16 @@
                  </div>
                  <div id="freegenStatus" style="font-size:0.65rem;color:rgba(255,255,255,0.55);min-height:1rem"></div>
               </div>
+              <div class="mb-2">
+                <div class="d-flex align-items-center justify-content-between">
+                  <small class="text-muted" data-i18n="env_sleev">Sleev (compress)</small>
+                  <div class="form-check form-switch" style="margin:0;min-height:0;padding:0;display:flex;align-items:center">
+                    <input class="form-check-input" type="checkbox" id="sleevToggle" onchange="toggleSleev(this.checked)" style="margin:0">
+                    <label class="form-check-label text-muted" for="sleevToggle" id="sleevStatusLabel" style="cursor:pointer;font-size:0.6rem;margin:0;padding-left:0.35rem">Off</label>
+                  </div>
+                </div>
+                <div id="sleevStatus" style="font-size:0.6rem;color:rgba(255,255,255,0.5);min-height:0.8rem;margin-top:2px"></div>
+              </div>
             </div>
           </div>
         </div>
@@ -642,6 +652,56 @@
       }
     }
 
+    async function toggleSleev(enabled) {
+      const label = document.getElementById('sleevStatusLabel');
+      const status = document.getElementById('sleevStatus');
+      label.textContent = enabled ? 'On' : 'Off';
+      status.textContent = enabled ? 'Starting...' : 'Stopping...';
+      try {
+        const r = await fetch('/api/sleev', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ enabled }) });
+        const d = await r.json();
+        if (!d.success) throw new Error(d.error || 'failed');
+        if (enabled) {
+          status.textContent = 'Waiting for gateway (may prompt browser sign-in on first run)...';
+          pollSleevStatus();
+        } else {
+          status.textContent = 'Stopped.';
+        }
+      } catch (e) {
+        status.textContent = 'Error: ' + e.message;
+        document.getElementById('sleevToggle').checked = !enabled;
+        label.textContent = !enabled ? 'On' : 'Off';
+      }
+    }
+
+    let sleevPollTimer = null;
+    async function pollSleevStatus() {
+      if (sleevPollTimer) clearTimeout(sleevPollTimer);
+      try {
+        const r = await fetch('/api/sleev');
+        const d = await r.json();
+        const toggle = document.getElementById('sleevToggle');
+        const label = document.getElementById('sleevStatusLabel');
+        const status = document.getElementById('sleevStatus');
+        toggle.checked = !!d.enabled;
+        label.textContent = d.enabled ? 'On' : 'Off';
+        if (d.ready) {
+          status.textContent = 'Active (compressing context)';
+          sleevPollTimer = null;
+          return;
+        }
+        if (d.enabled) {
+          status.textContent = d.lastError || 'Starting gateway...';
+          sleevPollTimer = setTimeout(pollSleevStatus, 3000);
+        } else {
+          status.textContent = '';
+          sleevPollTimer = null;
+        }
+      } catch {
+        sleevPollTimer = setTimeout(pollSleevStatus, 3000);
+      }
+    }
+
     function renderTokenPools() {
       const container = document.getElementById('tokenPoolsContainer');
       const blur = blurTokensEnabled ? 'token-blurred' : '';
@@ -800,6 +860,14 @@
             await setWallpaper(cd.wallpaperSource);
           } else {
             setWallpaperActive('none');
+          }
+          // Sleev toggle init
+          const sleevToggle = document.getElementById('sleevToggle');
+          const sleevLabel = document.getElementById('sleevStatusLabel');
+          if (sleevToggle) {
+            sleevToggle.checked = !!cd.sleevEnabled;
+            if (sleevLabel) sleevLabel.textContent = cd.sleevEnabled ? 'On' : 'Off';
+            pollSleevStatus();
           }
         }
         renderModels(); renderTokenPools(); updateSsModeStatus(); updateStats(); await fetchUsage();

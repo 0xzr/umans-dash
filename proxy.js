@@ -15,6 +15,10 @@ const FREEGEN_PROMPT_SIGNER = 'https://prompt-signer.freegen.app/api/test';
 const FREEGEN_IMAGE_GENERATOR = 'https://image-generator.freegen.app/api/test';
 const FREEGEN_WS_BRIDGE = 'wss://websocket-bridge.freegen.app/ws';
 
+const SLEEV_GATEWAY_HOST = '127.0.0.1';
+const SLEEV_GATEWAY_PORT = 17321;
+const SLEEV_GATEWAY_BASE = `http://${SLEEV_GATEWAY_HOST}:${SLEEV_GATEWAY_PORT}`;
+
 let ERROR_LOG_FILE = null;
 const ERROR_LOG_DIR = '.logs';
 
@@ -464,6 +468,7 @@ function loadConfig() {
   if (process.env.CACHE_ENABLED) rawConfig.CACHE_ENABLED = process.env.CACHE_ENABLED !== 'false';
   if (process.env.OVERRIDE_CONCURRENCY) rawConfig.OVERRIDE_CONCURRENCY = parseInt(process.env.OVERRIDE_CONCURRENCY);
   if (process.env.MAX_IMAGES) rawConfig.MAX_IMAGES = parseInt(process.env.MAX_IMAGES);
+  if (process.env.SLEEV_ENABLED !== undefined) rawConfig.SLEEV_ENABLED = process.env.SLEEV_ENABLED !== 'false';
 
   const requestTimeout = parseDuration(rawConfig.REQUEST_TIMEOUT);
   if (!rawConfig.LISTEN_ADDR) throw new Error('LISTEN_ADDR cannot be empty');
@@ -501,6 +506,7 @@ function loadConfig() {
     visionHandoffEnabled: rawConfig.VISION_HANDOFF_ENABLED !== false,
     visionHandoffModel: rawConfig.VISION_HANDOFF_MODEL || 'umans-kimi-k2.7',
     visionHandoffPrompt: rawConfig.VISION_HANDOFF_PROMPT || '',
+    sleevEnabled: rawConfig.SLEEV_ENABLED === true,
   };
 }
 
@@ -553,6 +559,7 @@ function saveConfig(cfg) {
     VISION_HANDOFF_ENABLED: cfg.visionHandoffEnabled !== false,
     VISION_HANDOFF_MODEL: cfg.visionHandoffModel || 'umans-kimi-k2.7',
     VISION_HANDOFF_PROMPT: cfg.visionHandoffPrompt || '',
+    SLEEV_ENABLED: cfg.sleevEnabled === true,
   }, null, 2));
 }
 
@@ -623,6 +630,7 @@ const I18N_STRINGS = {
   env_ss_mode: 'SS Mode',
   ss_mode_on: 'On',
   ss_mode_off: 'Off',
+  env_sleev: 'Sleev (compress)',
   env_wallpaper: 'Wallpaper',
   wp_none: 'None',
   wp_bing: 'Bing',
@@ -1092,6 +1100,17 @@ function loadUsageHistoryBuckets(db, from, to) {
   return map;
 }
 
+function getEarliestDataDate(db) {
+  try {
+    const stmt = dbPrepare(db, 'SELECT bucket FROM usage_history WHERE requests > 0 ORDER BY bucket ASC LIMIT 1');
+    const row = stmt.get();
+    return row ? row.bucket : null;
+  } catch (e) {
+    console.warn('[usage-cache] failed to get earliest data date:', e.message);
+    return null;
+  }
+}
+
 function upsertUsageHistoryBucket(db, bucket) {
   if (!bucket || !bucket.bucket) return false;
   try {
@@ -1196,20 +1215,52 @@ async function fetchUsageHistory() {
     console.log('[usage-history] serving from in-memory cache', usageHistoryCache.data.buckets?.length || 0, 'buckets');
     return usageHistoryCache.data;
   }
-  try {
-    const range = getUsageHistoryDateRange();
-    const db = openUsageDb();
-    const cached = db ? loadUsageHistoryBuckets(db, range.from, range.to) : {};
-    delete cached[range.today];
-    const allDates = generateDateStrings(range.from, range.to);
-    const missing = allDates.filter(d => !cached[d]);
-    console.log(`[usage-history] range ${range.from}..${range.today}, cached ${Object.keys(cached).length}, missing ${missing.length}`);
-    const mergedMap = { ...cached };
-    let fetchedAny = false;
-    if (missing.length > 0) {
-      const ranges = toContiguousRanges(missing);
-      console.log(`[usage-history] fetching ${ranges.length} chunk(s):`, ranges);
-      for (const [rFrom, rTo] of ranges) {
+  const range = getUsageHistoryDateRange();
+  const db = openUsageDb();
+  const cached = db ? loadUsageHistoryBuckets(db, range.from, range.to) : {};
+  delete cached[range.today];
+
+  // Determine the earliest day the API actually has data for, so we don't
+  // endlessly re-request older days that the API will never return.
+  // Once at least one non-zero day has been cached, any missing day older than
+  // the oldest cached day is treated as a pre-account "no data" day and is
+  // backfilled as a zero bucket instead of being fetched.
+  const cachedDates = Object.keys(cached).sort();
+  const oldestCachedDate = cachedDates.length > 0 ? cachedDates[0] : null;
+  // Also check the DB for the earliest day with real (non-zero) usage, which
+  // survives even if older zero-rows get evicted or the window rolls past them.
+  let earliestDataDate = oldestCachedDate;
+  if (db) {
+    const earliestFromDb = getEarliestDataDate(db);
+    if (earliestFromDb) {
+      earliestDataDate = earliestDataDate
+        ? [earliestDataDate, earliestFromDb].sort()[0]
+        : earliestFromDb;
+    }
+  }
+  earliestDataDate = earliestDataDate || null;
+
+  const allDates = generateDateStrings(range.from, range.to);
+  const missing = allDates.filter(d => !cached[d]);
+  // Days older than the earliest known data day are pre-account days the API
+  // will never return. Backfill them as zeros and persist so we stop asking.
+  const preAccount = missing.filter(d => earliestDataDate && d < earliestDataDate);
+  const toFetch = missing.filter(d => !(earliestDataDate && d < earliestDataDate));
+  for (const d of preAccount) {
+    if (d === range.today) continue;
+    const zero = { bucket: d, requests: 0, tokens_in: 0, tokens_out: 0, tokens_cached_read: 0 };
+    cached[d] = zero;
+    if (db) upsertUsageHistoryBucket(db, zero);
+  }
+  console.log(`[usage-history] range ${range.from}..${range.today}, cached ${Object.keys(cached).length}, missing ${missing.length}, toFetch ${toFetch.length}, preAccount ${preAccount.length}`);
+  const mergedMap = { ...cached };
+  let fetchedAny = false;
+  let failedChunks = 0;
+  if (toFetch.length > 0) {
+    const ranges = toContiguousRanges(toFetch);
+    console.log(`[usage-history] fetching ${ranges.length} chunk(s):`, ranges);
+    for (const [rFrom, rTo] of ranges) {
+      try {
         const data = await fetchHistoryRange(rFrom, rTo);
         if (data?.buckets) {
           fetchedAny = true;
@@ -1236,21 +1287,27 @@ async function fetchUsageHistory() {
             }
           }
         }
+      } catch (e) {
+        failedChunks++;
+        console.warn(`[usage-history] chunk ${rFrom}..${rTo} failed:`, e.message);
+        // Continue with the next chunk instead of aborting entirely.
       }
     }
-    if (!fetchedAny && Object.keys(mergedMap).length === 0) {
-      console.warn('[usage-history] nothing fetched and nothing cached, returning stale cache');
-      return usageHistoryCache.data;
-    }
-    const buckets = Object.keys(mergedMap).sort().reverse().map(d => mergedMap[d]);
-    console.log(`[usage-history] returning ${buckets.length} buckets`);
-    const result = { buckets };
-    usageHistoryCache = { data: result, time: Date.now(), ttl: 5 * 60 * 1000 };
-    return result;
-  } catch (e) {
-    console.warn('[usage-history] fetch failed:', e.message);
+  }
+  if (!fetchedAny && failedChunks > 0 && Object.keys(mergedMap).length === 0) {
+    console.warn('[usage-history] all chunks failed and nothing cached, returning stale cache');
+    // Don't update usageHistoryCache so the next poll can retry sooner.
     return usageHistoryCache.data;
   }
+  if (!fetchedAny && Object.keys(mergedMap).length === 0) {
+    console.warn('[usage-history] nothing fetched and nothing cached, returning stale cache');
+    return usageHistoryCache.data;
+  }
+  const buckets = Object.keys(mergedMap).sort().reverse().map(d => mergedMap[d]);
+  console.log(`[usage-history] returning ${buckets.length} buckets`);
+  const result = { buckets };
+  usageHistoryCache = { data: result, time: Date.now(), ttl: 5 * 60 * 1000 };
+  return result;
 }
 
 async function fetchConcurrency() {
@@ -1719,6 +1776,177 @@ function stampSessionLabel(payload, name, sessNum) {
 
 const UPSTREAM_AGENT = new https.Agent({ keepAlive: true, keepAliveMsecs: 60000, maxSockets: 128, timeout: 300000, maxFreeSockets: 64, scheduling: 'lifo' });
 
+// ── Sleev context-compression gateway manager ──────────────────────────────
+// Topology A (Sleev in front): opencode → Sleev (compress) → UMANS-PROXY → UMANS
+// Sleev is installed as a project dependency (package.json) and spawns a local
+// gateway daemon. First-run sign-in opens the browser for OAuth callback. The
+// proxy manages the gateway lifecycle (spawn on boot, kill on exit).
+const { execSync, spawn } = require('child_process');
+const SLEEV_HARNESS_HEADER = 'sleeve-harness';
+const SLEEV_BASE_URL_HEADER = 'sleeve-base-url';
+
+function resolveSleevBinary() {
+  // 1. Local project dependency (node_modules/.bin/sleev)
+  const localBin = path.join(__dirname, 'node_modules', '.bin', 'sleev') + (process.platform === 'win32' ? '.cmd' : '');
+  if (fs.existsSync(localBin)) return localBin;
+  // 2. Global PATH lookup
+  try {
+    const which = process.platform === 'win32' ? 'where' : 'which';
+    const resolved = execSync(`${which} sleev`, { stdio: ['ignore', 'pipe', 'ignore'], encoding: 'utf8' }).trim().split(/\r?\n/)[0];
+    if (resolved && fs.existsSync(resolved)) return resolved;
+  } catch {}
+  return null;
+}
+
+function isSleevLoggedIn(binPath) {
+  try {
+    const out = execSync(`"${binPath}" auth status`, { stdio: ['ignore', 'pipe', 'ignore'], encoding: 'utf8', timeout: 8000 });
+    // `sleev auth status` outputs JSON: {"signedIn": true/false, ...}
+    if (out.includes('"signedIn"')) return /"signedIn"\s*:\s*true/.test(out);
+    return /logged in|authenticated|signed in/i.test(out);
+  } catch {
+    return false;
+  }
+}
+
+async function startSleevSignIn(binPath) {
+  // `sleev auth login` opens a browser for OAuth and blocks until the
+  // callback completes. We spawn it and watch for completion.
+  return new Promise((resolve) => {
+    let stdout = '';
+    const child = spawn(binPath, ['auth', 'login'], { stdio: ['ignore', 'pipe', 'pipe'], shell: false });
+    sleevState.signInProcess = child;
+    child.stdout.on('data', (d) => { stdout += d.toString(); });
+    child.on('close', (code) => {
+      sleevState.signInProcess = null;
+      resolve(code === 0 || /success|logged in|authenticated/i.test(stdout));
+    });
+    child.on('error', () => { sleevState.signInProcess = null; resolve(false); });
+    // Safety timeout: don't block the proxy forever if the user walks away.
+    setTimeout(() => {
+      try { child.kill(); } catch {}
+      sleevState.signInProcess = null;
+      resolve(false);
+    }, 180000);
+  });
+}
+
+const sleevState = {
+  binary: null,
+  gatewayProcess: null,
+  signInProcess: null,
+  ready: false,
+  lastError: null,
+};
+
+function spawnSleevGateway(binPath) {
+  if (sleevState.gatewayProcess) return true;
+  try {
+    const child = spawn(binPath, ['gateway', 'start', '--host', SLEEV_GATEWAY_HOST, '--port', String(SLEEV_GATEWAY_PORT)], {
+      stdio: ['ignore', 'pipe', 'pipe'],
+      shell: false,
+      windowsHide: true,
+    });
+    sleevState.gatewayProcess = child;
+    child.stdout.on('data', (d) => { const s = d.toString().trim(); if (s) console.log(`[Sleev] ${s}`); });
+    child.stderr.on('data', (d) => { const s = d.toString().trim(); if (s) console.error(`[Sleev] ${s}`); });
+    child.on('exit', (code, signal) => {
+      console.log(`[Sleev] Gateway process exited (code=${code}, signal=${signal})`);
+      sleevState.gatewayProcess = null;
+      sleevState.ready = false;
+    });
+    child.on('error', (e) => {
+      console.error(`[Sleev] Failed to spawn gateway: ${e.message}`);
+      sleevState.gatewayProcess = null;
+      sleevState.lastError = e.message;
+    });
+    return true;
+  } catch (e) {
+    sleevState.lastError = e.message;
+    console.error(`[Sleev] Spawn failed: ${e.message}`);
+    return false;
+  }
+}
+
+async function pingSleevGateway() {
+  try {
+    const resp = await fetch(`${SLEEV_GATEWAY_BASE}/health`, { signal: AbortSignal.timeout(3000) });
+    return resp.ok;
+  } catch {
+    return false;
+  }
+}
+
+async function waitForSleevGateway(maxWaitMs = 15000) {
+  const deadline = Date.now() + maxWaitMs;
+  while (Date.now() < deadline) {
+    if (await pingSleevGateway()) return true;
+    await new Promise(r => setTimeout(r, 500));
+  }
+  return false;
+}
+
+async function startSleev() {
+  if (!config.sleevEnabled) return false;
+  const bin = resolveSleevBinary();
+  if (!bin) {
+    sleevState.lastError = 'sleev binary not found. Run `npm install` in the proxy directory.';
+    console.error(`[Sleev] ${sleevState.lastError}`);
+    return false;
+  }
+  sleevState.binary = bin;
+
+  if (!isSleevLoggedIn(bin)) {
+    console.log('[Sleev] Not signed in. Attempting browser sign-in via `sleev auth login`...');
+    console.log('[Sleev] If this fails, run `npx sleev auth login` in a terminal, then restart the proxy.');
+    const ok = await startSleevSignIn(bin);
+    if (!ok) {
+      sleevState.lastError = 'sign-in required — run `npx sleev auth login` manually, then restart';
+      console.error('[Sleev] Interactive sign-in did not complete.');
+      return false;
+    }
+    console.log('[Sleev] Sign-in successful.');
+  }
+
+  console.log(`[Sleev] Starting gateway on ${SLEEV_GATEWAY_HOST}:${SLEEV_GATEWAY_PORT}...`);
+  if (!spawnSleevGateway(bin)) return false;
+
+  const ready = await waitForSleevGateway();
+  if (!ready) {
+    sleevState.lastError = 'gateway did not become healthy within timeout';
+    console.error(`[Sleev] ${sleevState.lastError}`);
+    return false;
+  }
+  sleevState.ready = true;
+  sleevState.lastError = null;
+  console.log('[Sleev] Gateway ready. Chat traffic will route through Sleev for context compression.');
+  return true;
+}
+
+function stopSleev() {
+  if (sleevState.signInProcess) {
+    try { sleevState.signInProcess.kill(); } catch {}
+    sleevState.signInProcess = null;
+  }
+  if (sleevState.gatewayProcess) {
+    console.log('[Sleev] Stopping gateway...');
+    try { sleevState.gatewayProcess.kill(); } catch {}
+    sleevState.gatewayProcess = null;
+  }
+  sleevState.ready = false;
+}
+
+async function getSleevStatus() {
+  return {
+    enabled: config.sleevEnabled === true,
+    ready: sleevState.ready,
+    binary: sleevState.binary ? path.basename(sleevState.binary) : null,
+    lastError: sleevState.lastError,
+    loggedIn: sleevState.binary ? isSleevLoggedIn(sleevState.binary) : false,
+    gatewayBase: SLEEV_GATEWAY_BASE,
+  };
+}
+
 class UpstreamClient {
   constructor(cfg) {
     this.baseURL = cfg.upstreamBaseURL;
@@ -1962,7 +2190,7 @@ function buildReasoningVariants(reasoningCaps) {
     if (lvl === 'none') continue;
     const budget = REASONING_LEVEL_BUDGETS[lvl];
     if (!budget) continue;
-    variants[lvl] = { thinking: { type: 'enabled', budgetTokens: budget } };
+    variants[lvl] = { thinking: { type: 'adaptive', budgetTokens: budget } };
     added = true;
   }
   return added ? variants : null;
@@ -2365,6 +2593,7 @@ async function handleHealthz(req, res) {
     runtime_version: RUNTIME_VERSION,
     port: parseListenPort(config.listenAddr),
     cache: { ...responseCache.stats, enabled: config.cacheEnabled },
+    sleev: { enabled: config.sleevEnabled === true, ready: sleevState.ready, gateway: SLEEV_GATEWAY_BASE },
   });
 }
 
@@ -2614,7 +2843,7 @@ async function proxyChatRequest(res, payload, requestedModel, writeError, writeU
   const modelInfo = modelInfoMap[resolvedModel] || {};
   const reasoningCaps = modelInfo.capabilities?.reasoning;
   if (reasoningCaps?.supported === true && reasoningCaps.can_disable === false) {
-    payload.thinking = { type: 'enabled' };
+    payload.thinking = { type: 'adaptive' };
   }
 
   await performVisionHandoff(payload, resolvedModel, slot, sessNum, reqStart);
@@ -2838,6 +3067,7 @@ async function handleRequest(req, res) {
         visionHandoffEnabled: config.visionHandoffEnabled !== false,
         visionHandoffModel: config.visionHandoffModel || 'umans-kimi-k2.7',
         visionHandoffPrompt: config.visionHandoffPrompt || '',
+        sleevEnabled: config.sleevEnabled === true,
       };
       writeJSON(res, 200, safeConfig);
       return;
@@ -2862,6 +3092,7 @@ async function handleRequest(req, res) {
         if (typeof newConfig.visionHandoffEnabled === 'boolean') config.visionHandoffEnabled = newConfig.visionHandoffEnabled;
         if (typeof newConfig.visionHandoffModel === 'string') config.visionHandoffModel = newConfig.visionHandoffModel.trim();
         if (typeof newConfig.visionHandoffPrompt === 'string') config.visionHandoffPrompt = newConfig.visionHandoffPrompt;
+        if (typeof newConfig.sleevEnabled === 'boolean') config.sleevEnabled = newConfig.sleevEnabled;
         if (Array.isArray(newConfig.keys)) {
           config.keys = newConfig.keys;
           keyPool = new KeyPool(config.keys.filter(k => k.key));
@@ -3165,6 +3396,40 @@ async function handleRequest(req, res) {
     return;
   }
 
+  if (pathname === '/api/sleev') {
+    if (req.method === 'GET') {
+      const status = await getSleevStatus();
+      writeJSON(res, 200, status);
+      return;
+    }
+    if (req.method === 'POST') {
+      try {
+        const body = await readBody(req);
+        const parsed = JSON.parse(body);
+        if (typeof parsed.enabled === 'boolean') {
+          config.sleevEnabled = parsed.enabled;
+          debouncedSaveConfig(config);
+          if (parsed.enabled && !sleevState.ready) {
+            // Start gateway asynchronously; respond immediately so the
+            // dashboard doesn't block on the (possibly interactive) sign-in.
+            startSleev().then(ok => {
+              if (ok) debouncedSetupOpencodeConfig();
+            });
+          } else if (!parsed.enabled) {
+            stopSleev();
+            debouncedSetupOpencodeConfig();
+          }
+          writeJSON(res, 200, { success: true, enabled: config.sleevEnabled });
+        } else {
+          writeJSON(res, 400, { error: 'missing "enabled" boolean field' });
+        }
+      } catch (e) {
+        writeJSON(res, 400, { error: e.message });
+      }
+      return;
+    }
+  }
+
   if (pathname === '/healthz') { await handleHealthz(req, res); return; }
   if (pathname === '/v1/models') { await handleModels(req, res); return; }
   if (pathname === '/v1/chat/completions') { await handleChatCompletions(req, res); return; }
@@ -3310,15 +3575,35 @@ function setupOpencodeConfig() {
 
         models[m] = entry;
       }
-      const providerEntry = {
-        npm: '@ai-sdk/openai-compatible',
-        name: 'Umans.AI-Proxy',
-        options: {
-          baseURL: `http://localhost:${port}/v1`,
-          apiKey: config.apiKeys && config.apiKeys.length > 0 ? config.apiKeys[0] : 'umans-proxy',
-        },
-        models,
-      };
+      const providerEntry = (() => {
+        const apiKey = config.apiKeys && config.apiKeys.length > 0 ? config.apiKeys[0] : 'umans-proxy';
+        if (config.sleevEnabled && sleevState.ready) {
+          // Topology A: opencode → Sleev (compress) → UMANS-PROXY → UMANS.
+          // Point opencode at the Sleev gateway; tell Sleev where our proxy is.
+          return {
+            npm: '@ai-sdk/openai-compatible',
+            name: 'Umans.AI-Proxy (Sleev)',
+            options: {
+              baseURL: `${SLEEV_GATEWAY_BASE}/v1`,
+              apiKey,
+              headers: {
+                [SLEEV_HARNESS_HEADER]: 'opencode',
+                [SLEEV_BASE_URL_HEADER]: `http://127.0.0.1:${port}/v1`,
+              },
+            },
+            models,
+          };
+        }
+        return {
+          npm: '@ai-sdk/openai-compatible',
+          name: 'Umans.AI-Proxy',
+          options: {
+            baseURL: `http://localhost:${port}/v1`,
+            apiKey,
+          },
+          models,
+        };
+      })();
 
       const dir = path.dirname(configFile);
       if (!fs.existsSync(dir)) fs.mkdirSync(dir, { recursive: true });
@@ -3336,6 +3621,13 @@ function setupOpencodeConfig() {
       }
       if (!existing.provider || typeof existing.provider !== 'object') existing.provider = {};
       existing.provider['umans'] = providerEntry;
+
+      // When Sleev is active, disable opencode's own context pruning so Sleev
+      // manages context compression instead.
+      if (config.sleevEnabled && sleevState.ready) {
+        if (!existing.compaction || typeof existing.compaction !== 'object') existing.compaction = {};
+        existing.compaction.prune = false;
+      }
 
       // Ensure project guidance is loaded so opencode follows UMANS-Proxy conventions
       // (e.g. exact edit matching, using webfetch instead of websearch, etc.)
@@ -3365,6 +3657,20 @@ process.on('unhandledRejection', (reason) => {
   console.error(`[CRASH] unhandledRejection: ${reason?.message || reason}`);
   if (reason?.stack) console.error(reason.stack);
 });
+
+// Shutdown hooks — stop the Sleev gateway child process before we exit so we
+// never leave an orphaned daemon behind. Covers normal Ctrl-C, the
+// /api/restart exit(42) path, and unexpected terminations.
+function gracefulShutdown(signal) {
+  console.log(`\n[Shutdown] ${signal} received, cleaning up...`);
+  stopSleev();
+  if (server) { try { server.close(); } catch {} }
+  process.exit(0);
+}
+process.on('SIGINT', () => gracefulShutdown('SIGINT'));
+process.on('SIGTERM', () => gracefulShutdown('SIGTERM'));
+process.on('beforeExit', () => stopSleev());
+process.on('exit', () => stopSleev());
 
 let upstream;
 let server;
@@ -3408,6 +3714,13 @@ async function startServer(retryPort = null) {
     await getModelsDevCatalog();
   } catch (e) {
     console.log(`[Models.dev] Could not preload reasoning catalog: ${e.message}`);
+  }
+
+  // Start the Sleev context-compression gateway if enabled. This must happen
+  // before setupOpencodeConfig() runs so the provider entry knows whether
+  // to point opencode at the Sleev gateway.
+  if (config.sleevEnabled) {
+    await startSleev();
   }
 
   let retryCount = 0;

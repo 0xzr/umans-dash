@@ -18,5 +18,7 @@
   ],
   "author": "",
   "license": "MIT",
-  "dependencies": {}
+  "dependencies": {
+    "sleev": "latest"
+  }
 }
