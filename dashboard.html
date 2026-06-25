@@ -167,7 +167,7 @@
         <div class="card" data-glass>
           <div class="glass-panel"></div>
           <div class="card-content">
-            <div class="card-header"><span><i class="bi bi-window me-2"></i><span data-i18n="section_window">Window</span></span></div>
+            <div class="card-header d-flex justify-content-between align-items-center"><span><i class="bi bi-window me-2"></i><span data-i18n="section_window">Window</span></span><span style="font-size:11px;color:rgba(255,255,255,0.55)" id="windowSource">--</span></div>
             <div class="card-body">
               <div class="row g-2">
                 <div class="col-3">
@@ -963,10 +963,11 @@ container.innerHTML = `<div style="width:100%;font-size:11px;white-space:nowrap"
 
     async function fetchUsage() {
       try {
-        const [ur,hr]=await Promise.all([fetch('/api/umans/usage'),fetch('/api/umans/usage-history')]);
-        const u=await ur.json(), h=await hr.json();
+        const [ur,hr,mr]=await Promise.all([fetch('/api/umans/usage'),fetch('/api/umans/usage-history'),fetch('/api/metrics')]);
+        const u=await ur.json(), h=await hr.json(), m=mr.ok ? await mr.json() : null;
         let winTokens=0, winInputTokens=0, winReqs=0, cached=0, histTokens=0, histInputTokens=0, histReqs=0, histCached=0;
         let usageBuckets = [];
+        let windowSource = 'UMANS';
         const winSrc = (u.window && (u.window.tokens_in !== undefined || u.window.tokens_out !== undefined || u.window.requests_in_window !== undefined)) ? u.window : u.usage;
         if (winSrc) {
           winReqs = winSrc.requests_in_window||0;
@@ -993,17 +994,37 @@ container.innerHTML = `<div style="width:100%;font-size:11px;white-space:nowrap"
           labelEl.textContent = t('label_tokens','Tokens');
           labelEl.title = '';
         }
+        const localReqs = m?.requests?.completed || 0;
+        const localFailedReqs = m?.requests?.failed || 0;
+        const hasLocalMetrics = localReqs > 0 || localFailedReqs > 0 || (m?.tokens?.total || 0) > 0;
+        const accountWindowUnavailable = winReqs === 0 && winTokens === 0 && cached === 0;
+        if (accountWindowUnavailable && hasLocalMetrics) {
+          winReqs = localReqs + localFailedReqs;
+          winInputTokens = (m.tokens?.input || 0) + (m.tokens?.cached || 0);
+          winTokens = m.tokens?.total || 0;
+          cached = m.tokens?.cached || 0;
+          windowSource = 'Local proxy';
+          if (labelEl) {
+            labelEl.textContent = t('label_tokens','Tokens');
+            labelEl.title = 'Local proxy telemetry since the current proxy process started. UMANS account-window usage is unavailable without an app session.';
+          }
+        }
         usagePage = 0;
         const cachedPct = winInputTokens > 0 ? ((cached/winInputTokens)*100).toFixed(1) : '0.0';
         document.getElementById('totalRequests').textContent = winReqs.toLocaleString();
         document.getElementById('totalTokens').textContent = winTokens.toLocaleString();
         document.getElementById('cachedPct').textContent = cachedPct + '%';
+        const windowSourceEl = document.getElementById('windowSource');
+        if (windowSourceEl) {
+          windowSourceEl.textContent = windowSource;
+          windowSourceEl.title = windowSource === 'Local proxy' ? 'Showing local proxy telemetry since process start because UMANS app-window usage is unavailable.' : 'Showing UMANS account-window usage.';
+        }
         const histCachedPct = histInputTokens > 0 ? ((histCached/histInputTokens)*100).toFixed(0) : 0;
         document.getElementById('histTotalTokens').textContent = histTokens.toLocaleString();
         document.getElementById('histCachedPct').textContent = `(${histCachedPct}% cached)`;
         document.getElementById('histTotalReqs').textContent = histReqs.toLocaleString();
         renderUsagePage();
-      } catch { document.getElementById('totalTokens').textContent='--';document.getElementById('totalRequests').textContent='--';document.getElementById('cachedPct').textContent='--'; }
+      } catch { document.getElementById('totalTokens').textContent='--';document.getElementById('totalRequests').textContent='--';document.getElementById('cachedPct').textContent='--';const windowSourceEl=document.getElementById('windowSource');if(windowSourceEl)windowSourceEl.textContent='offline'; }
     }
 
     function fmtMs(ms) {
