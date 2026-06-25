@@ -1059,8 +1059,8 @@ container.innerHTML = `<div style="width:100%;font-size:11px;white-space:nowrap"
       document.getElementById('liveActiveQueued').title = `raw active/queued ${req.active || 0}/${req.queued || 0}; weighted active/queued ${fmtWeight(activeWeight)}/${fmtWeight(queuedWeight)}; Flash counts as ${flashWeight}`;
       document.getElementById('liveCap').textContent = conc.limit == null ? '--' : String(conc.limit);
       document.getElementById('liveCap').title = conc.limit == null ? 'No local concurrency cap' : `weighted cap ${conc.limit}, remaining ${remainingWeight ?? '--'}; Flash counts as ${flashWeight}`;
-      document.getElementById('liveQueueDelay').textContent = `${fmtMs(req.avg_queue_delay_ms)} avg`;
-      document.getElementById('liveQueueDelay').title = `max ${fmtMs(req.max_queue_delay_ms || 0)}, total queued ${req.queued_total || 0}`;
+      document.getElementById('liveQueueDelay').innerHTML = `<div>${fmtMs(req.avg_queue_delay_ms)} avg</div><div style="font-size:11px;line-height:1.05;color:rgba(255,255,255,0.72);font-weight:600">${fmtMs(req.oldest_queued_ms || 0)} oldest</div>`;
+      document.getElementById('liveQueueDelay').title = `oldest live queued ${fmtMs(req.oldest_queued_ms || 0)}, max completed wait ${fmtMs(req.max_queue_delay_ms || 0)}, total queued ${req.queued_total || 0}`;
       document.getElementById('liveRequests').textContent = `${req.completed || 0}/${req.failed || 0}`;
       document.getElementById('liveRequests').title = 'completed / failed';
       document.getElementById('liveTokens').textContent = (tok.total || 0).toLocaleString();

@@ -422,8 +422,39 @@ function queuedRequestWeight() {
   return roundConcurrencyWeight(requestQueue.reduce((sum, item) => sum + (item.weight || DEFAULT_CONCURRENCY_WEIGHT), 0));
 }
 
+function oldestQueuedMs(now = Date.now()) {
+  if (requestQueue.length === 0) return 0;
+  return Math.max(0, now - Math.min(...requestQueue.map(item => item.queuedAt || now)));
+}
+
 function canStartWeightedRequest(weight, limit) {
   return limit === null || activeRequestWeight + weight <= limit + Number.EPSILON;
+}
+
+function removeQueuedItem(item, reason) {
+  const idx = requestQueue.indexOf(item);
+  if (idx < 0) return false;
+  requestQueue.splice(idx, 1);
+  if (item.cleanup) item.cleanup();
+  recordCompleted(item.metricId, {
+    statusCode: 499,
+    failed: true,
+    error: reason || 'client disconnected while queued',
+  });
+  processQueue();
+  return true;
+}
+
+function enqueueRequest(item) {
+  item.queuedAt = item.queuedAt || Date.now();
+  const onClose = () => removeQueuedItem(item, 'client disconnected while queued');
+  item.req?.on?.('aborted', onClose);
+  item.res?.on?.('close', onClose);
+  item.cleanup = () => {
+    item.req?.off?.('aborted', onClose);
+    item.res?.off?.('close', onClose);
+  };
+  requestQueue.push(item);
 }
 
 function recordAccepted(format, model, stream, weight = DEFAULT_CONCURRENCY_WEIGHT) {
@@ -556,6 +587,7 @@ function metricsSnapshot() {
   const avgQueueDelayMs = proxyMetrics.started > 0 ? Math.round(proxyMetrics.totalQueueDelayMs / proxyMetrics.started) : 0;
   const avgDurationMs = (proxyMetrics.completed + proxyMetrics.failed) > 0 ? Math.round(proxyMetrics.totalDurationMs / (proxyMetrics.completed + proxyMetrics.failed)) : 0;
   const queuedWeight = queuedRequestWeight();
+  const oldestQueueMs = oldestQueuedMs();
   return {
     started_at: proxyMetrics.startedAt,
     requests: {
@@ -567,6 +599,7 @@ function metricsSnapshot() {
       active_weight: roundConcurrencyWeight(activeRequestWeight),
       queued: requestQueue.length,
       queued_weight: queuedWeight,
+      oldest_queued_ms: oldestQueueMs,
       queued_total: proxyMetrics.queued,
       avg_queue_delay_ms: avgQueueDelayMs,
       max_queue_delay_ms: proxyMetrics.maxQueueDelayMs,
@@ -580,6 +613,7 @@ function metricsSnapshot() {
       active_weight: roundConcurrencyWeight(activeRequestWeight),
       queued: requestQueue.length,
       queued_weight: queuedWeight,
+      oldest_queued_ms: oldestQueueMs,
       flash_weight: FLASH_CONCURRENCY_WEIGHT,
       remaining_weight: (() => {
         const limit = getEffectiveConcurrency().limit;
@@ -3072,6 +3106,7 @@ function processQueue() {
     const weight = item.weight || DEFAULT_CONCURRENCY_WEIGHT;
     if (!canStartWeightedRequest(weight, limit)) return;
     requestQueue.shift();
+    if (item.cleanup) item.cleanup();
     if (item.res.writableEnded) continue;
     activeRequests++;
     activeRequestWeight += weight;
@@ -3102,7 +3137,7 @@ async function handleChatCompletions(req, res) {
   const limit = getEffectiveConcurrency().limit;
   if (!canStartWeightedRequest(weight, limit)) {
     recordQueued(metricId);
-    requestQueue.push({ res, payload, model: requestedModel, writeError: writeOpenAIError, writePassthroughError, skipLabel, req, metricId, queuedAt: Date.now(), weight });
+    enqueueRequest({ res, payload, model: requestedModel, writeError: writeOpenAIError, writePassthroughError, skipLabel, req, metricId, queuedAt: Date.now(), weight });
     return;
   }
   activeRequests++;
@@ -3231,7 +3266,7 @@ async function handleAnthropicMessages(req, res) {
   const limit = getEffectiveConcurrency().limit;
   if (!canStartWeightedRequest(weight, limit)) {
     recordQueued(metricId);
-    requestQueue.push({ res, payload: anthropicPayload, model: requestedModel, writeError: writeAnthropicError, writePassthroughError: writeAnthropicPassthroughError, skipLabel, req, format: 'anthropic', metricId, queuedAt: Date.now(), weight });
+    enqueueRequest({ res, payload: anthropicPayload, model: requestedModel, writeError: writeAnthropicError, writePassthroughError: writeAnthropicPassthroughError, skipLabel, req, format: 'anthropic', metricId, queuedAt: Date.now(), weight });
     return;
   }
   activeRequests++;
@@ -3476,6 +3511,11 @@ async function validateApiKey() {
 }
 
 async function handleRequest(req, res) {
+  // Agent calls can sit in the local weighted queue before they are sent
+  // upstream. Do not let Node's HTTP socket timers kill a healthy queued call.
+  req.setTimeout?.(0);
+  res.setTimeout?.(0);
+
   const parsedUrl = new URL(req.url, 'http://localhost');
   const pathname = parsedUrl.pathname;
 
@@ -3885,6 +3925,7 @@ async function handleRequest(req, res) {
           active_weight: activeWeight,
           queued: requestQueue.length,
           queued_weight: queuedRequestWeight(),
+          oldest_queued_ms: oldestQueuedMs(),
           flash_weight: FLASH_CONCURRENCY_WEIGHT,
           remaining_weight: effective.limit === null ? null : roundConcurrencyWeight(Math.max(0, effective.limit - activeWeight)),
         });
@@ -4329,6 +4370,10 @@ async function startServer(retryPort = null) {
   const basePort = parseListenPort(config.listenAddr);
   let port = retryPort || basePort;
   server = http.createServer(handleRequest);
+  server.timeout = 0;
+  server.requestTimeout = 0;
+  server.headersTimeout = 0;
+  server.keepAliveTimeout = Math.max(config.requestTimeout, 60 * 1000);
 
   server.on('error', (err) => {
     if (err.code === 'EADDRINUSE') {
