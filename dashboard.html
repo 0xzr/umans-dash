@@ -1033,6 +1033,11 @@ container.innerHTML = `<div style="width:100%;font-size:11px;white-space:nowrap"
       return (ms / 1000).toFixed(ms < 10000 ? 1 : 0) + 's';
     }
 
+    function fmtWeight(n) {
+      n = Number(n || 0);
+      return Number.isInteger(n) ? String(n) : n.toFixed(1);
+    }
+
     function cacheHitPct(cache) {
       const hits = cache?.hits || 0;
       const misses = cache?.misses || 0;
@@ -1047,10 +1052,11 @@ container.innerHTML = `<div style="width:100%;font-size:11px;white-space:nowrap"
       const tok = liveMetrics.tokens || {};
       const cache = liveMetrics.cache || {};
       const activeWeight = req.active_weight ?? conc.active_weight ?? 0;
+      const queuedWeight = req.queued_weight ?? conc.queued_weight ?? 0;
       const remainingWeight = conc.remaining_weight;
       const flashWeight = conc.flash_weight ?? 0.5;
-      document.getElementById('liveActiveQueued').textContent = `${req.active || 0}/${req.queued || 0}`;
-      document.getElementById('liveActiveQueued').title = `weighted active ${activeWeight}; Flash counts as ${flashWeight}`;
+      document.getElementById('liveActiveQueued').innerHTML = `<div>${req.active || 0}/${req.queued || 0}</div><div style="font-size:11px;line-height:1.05;color:rgba(255,255,255,0.72);font-weight:600">w ${fmtWeight(activeWeight)}/${fmtWeight(queuedWeight)}</div>`;
+      document.getElementById('liveActiveQueued').title = `raw active/queued ${req.active || 0}/${req.queued || 0}; weighted active/queued ${fmtWeight(activeWeight)}/${fmtWeight(queuedWeight)}; Flash counts as ${flashWeight}`;
       document.getElementById('liveCap').textContent = conc.limit == null ? '--' : String(conc.limit);
       document.getElementById('liveCap').title = conc.limit == null ? 'No local concurrency cap' : `weighted cap ${conc.limit}, remaining ${remainingWeight ?? '--'}; Flash counts as ${flashWeight}`;
       document.getElementById('liveQueueDelay').textContent = `${fmtMs(req.avg_queue_delay_ms)} avg`;

@@ -418,6 +418,10 @@ function roundConcurrencyWeight(value) {
   return Math.round((value || 0) * 100) / 100;
 }
 
+function queuedRequestWeight() {
+  return roundConcurrencyWeight(requestQueue.reduce((sum, item) => sum + (item.weight || DEFAULT_CONCURRENCY_WEIGHT), 0));
+}
+
 function canStartWeightedRequest(weight, limit) {
   return limit === null || activeRequestWeight + weight <= limit + Number.EPSILON;
 }
@@ -551,6 +555,7 @@ function recordCompleted(metricId, details = {}) {
 function metricsSnapshot() {
   const avgQueueDelayMs = proxyMetrics.started > 0 ? Math.round(proxyMetrics.totalQueueDelayMs / proxyMetrics.started) : 0;
   const avgDurationMs = (proxyMetrics.completed + proxyMetrics.failed) > 0 ? Math.round(proxyMetrics.totalDurationMs / (proxyMetrics.completed + proxyMetrics.failed)) : 0;
+  const queuedWeight = queuedRequestWeight();
   return {
     started_at: proxyMetrics.startedAt,
     requests: {
@@ -561,6 +566,7 @@ function metricsSnapshot() {
       active: activeRequests,
       active_weight: roundConcurrencyWeight(activeRequestWeight),
       queued: requestQueue.length,
+      queued_weight: queuedWeight,
       queued_total: proxyMetrics.queued,
       avg_queue_delay_ms: avgQueueDelayMs,
       max_queue_delay_ms: proxyMetrics.maxQueueDelayMs,
@@ -573,6 +579,7 @@ function metricsSnapshot() {
       active: activeRequests,
       active_weight: roundConcurrencyWeight(activeRequestWeight),
       queued: requestQueue.length,
+      queued_weight: queuedWeight,
       flash_weight: FLASH_CONCURRENCY_WEIGHT,
       remaining_weight: (() => {
         const limit = getEffectiveConcurrency().limit;
@@ -3877,6 +3884,7 @@ async function handleRequest(req, res) {
           active: activeRequests,
           active_weight: activeWeight,
           queued: requestQueue.length,
+          queued_weight: queuedRequestWeight(),
           flash_weight: FLASH_CONCURRENCY_WEIGHT,
           remaining_weight: effective.limit === null ? null : roundConcurrencyWeight(Math.max(0, effective.limit - activeWeight)),
         });
