@@ -151,7 +151,7 @@ async function waitForHealth(port, child, getLogs) {
     assert.strictEqual(data.model, 'umans-glm-5.2');
     assert.ok(seen.messages, 'mock upstream did not receive /v1/messages');
     assert.strictEqual(seen.messages.body.model, 'umans-glm-5.2');
-    assert.strictEqual(seen.messages.headers['x-api-key'], 'upstream-key');
+    assert.strictEqual(seen.messages.headers.authorization, 'Bearer upstream-key');
     assert.strictEqual(seen.messages.headers['anthropic-version'], '2023-06-01');
 
     const modelsResp = await fetch(`http://127.0.0.1:${proxyPort}/v1/models`, {

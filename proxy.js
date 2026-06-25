@@ -2119,7 +2119,7 @@ class UpstreamClient {
 
   anthropicHeaders(stream = false) {
     return {
-      'x-api-key': this.apiKey,
+      'Authorization': `Bearer ${this.apiKey}`,
       'anthropic-version': '2023-06-01',
       'Content-Type': 'application/json',
       'Accept': stream ? 'text/event-stream' : 'application/json',
