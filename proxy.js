@@ -379,6 +379,7 @@ function writeAnthropicPassthroughError(res, statusCode, body) {
 }
 
 let activeRequests = 0;
+let activeRequestWeight = 0;
 let requestQueue = [];
 let metricsRequestSeq = 0;
 const proxyMetrics = {
@@ -406,7 +407,22 @@ function modelMetrics(model) {
   return proxyMetrics.byModel[key];
 }
 
-function recordAccepted(format, model, stream) {
+const FLASH_CONCURRENCY_WEIGHT = 0.5;
+const DEFAULT_CONCURRENCY_WEIGHT = 1;
+
+function requestWeightForModel(model) {
+  return resolveModelId(model) === 'umans-flash' ? FLASH_CONCURRENCY_WEIGHT : DEFAULT_CONCURRENCY_WEIGHT;
+}
+
+function roundConcurrencyWeight(value) {
+  return Math.round((value || 0) * 100) / 100;
+}
+
+function canStartWeightedRequest(weight, limit) {
+  return limit === null || activeRequestWeight + weight <= limit + Number.EPSILON;
+}
+
+function recordAccepted(format, model, stream, weight = DEFAULT_CONCURRENCY_WEIGHT) {
   const id = ++metricsRequestSeq;
   proxyMetrics.accepted++;
   modelMetrics(model).accepted++;
@@ -415,6 +431,7 @@ function recordAccepted(format, model, stream) {
     format,
     model,
     stream: !!stream,
+    weight,
     acceptedAt: Date.now(),
     startedAt: null,
     queuedMs: 0,
@@ -429,7 +446,7 @@ function recordQueued(metricId) {
   if (item) item.status = 'queued';
 }
 
-function recordStarted(metricId, queuedMs = 0) {
+function recordStarted(metricId, queuedMs = 0, weight = DEFAULT_CONCURRENCY_WEIGHT) {
   proxyMetrics.started++;
   proxyMetrics.totalQueueDelayMs += queuedMs;
   proxyMetrics.maxQueueDelayMs = Math.max(proxyMetrics.maxQueueDelayMs, queuedMs);
@@ -437,6 +454,7 @@ function recordStarted(metricId, queuedMs = 0) {
   if (item) {
     item.startedAt = Date.now();
     item.queuedMs = queuedMs;
+    item.weight = weight;
     item.status = 'active';
   }
 }
@@ -520,6 +538,7 @@ function recordCompleted(metricId, details = {}) {
     statusCode,
     durationMs,
     queuedMs: item.queuedMs || 0,
+    weight: item.weight || DEFAULT_CONCURRENCY_WEIGHT,
     tokens: usage,
     error: details.error ? String(details.error).slice(0, 160) : '',
   };
@@ -540,6 +559,7 @@ function metricsSnapshot() {
       completed: proxyMetrics.completed,
       failed: proxyMetrics.failed,
       active: activeRequests,
+      active_weight: roundConcurrencyWeight(activeRequestWeight),
       queued: requestQueue.length,
       queued_total: proxyMetrics.queued,
       avg_queue_delay_ms: avgQueueDelayMs,
@@ -548,7 +568,17 @@ function metricsSnapshot() {
     },
     tokens: proxyMetrics.tokens,
     cache: { ...responseCache.stats, enabled: config?.cacheEnabled !== false },
-    concurrency: { ...getEffectiveConcurrency(), active: activeRequests, queued: requestQueue.length },
+    concurrency: {
+      ...getEffectiveConcurrency(),
+      active: activeRequests,
+      active_weight: roundConcurrencyWeight(activeRequestWeight),
+      queued: requestQueue.length,
+      flash_weight: FLASH_CONCURRENCY_WEIGHT,
+      remaining_weight: (() => {
+        const limit = getEffectiveConcurrency().limit;
+        return limit === null ? null : roundConcurrencyWeight(Math.max(0, limit - activeRequestWeight));
+      })(),
+    },
     active: Array.from(proxyMetrics.active.values()).map(item => ({
       ...item,
       ageMs: Date.now() - item.acceptedAt,
@@ -3030,17 +3060,21 @@ function processQueue() {
   if (requestQueue.length === 0) return;
   const limit = getEffectiveConcurrency().limit;
   if (limit === null) return;
-  while (requestQueue.length > 0 && activeRequests < limit) {
-    const item = requestQueue.shift();
+  while (requestQueue.length > 0) {
+    const item = requestQueue[0];
+    const weight = item.weight || DEFAULT_CONCURRENCY_WEIGHT;
+    if (!canStartWeightedRequest(weight, limit)) return;
+    requestQueue.shift();
     if (item.res.writableEnded) continue;
     activeRequests++;
-    recordStarted(item.metricId, Date.now() - (item.queuedAt || Date.now()));
+    activeRequestWeight += weight;
+    recordStarted(item.metricId, Date.now() - (item.queuedAt || Date.now()), weight);
     if (item.format === 'anthropic') {
       proxyAnthropicRequest(item.res, item.payload, item.model, item.writeError, item.writePassthroughError, item.skipLabel, item.req, item.metricId)
-        .finally(() => { recordCompleted(item.metricId, { failed: true, error: 'request ended without completion' }); activeRequests--; processQueue(); });
+        .finally(() => { recordCompleted(item.metricId, { failed: true, error: 'request ended without completion' }); activeRequests = Math.max(0, activeRequests - 1); activeRequestWeight = roundConcurrencyWeight(Math.max(0, activeRequestWeight - weight)); processQueue(); });
     } else {
       proxyChatRequest(item.res, item.payload, item.model, item.writeError, item.writePassthroughError, item.skipLabel, item.req, item.metricId)
-        .finally(() => { recordCompleted(item.metricId, { failed: true, error: 'request ended without completion' }); activeRequests--; processQueue(); });
+        .finally(() => { recordCompleted(item.metricId, { failed: true, error: 'request ended without completion' }); activeRequests = Math.max(0, activeRequests - 1); activeRequestWeight = roundConcurrencyWeight(Math.max(0, activeRequestWeight - weight)); processQueue(); });
     }
   }
 }
@@ -3054,18 +3088,21 @@ async function handleChatCompletions(req, res) {
   const requestedModel = (payload.model || '').trim();
   if (!requestedModel) { writeOpenAIError(res, 400, 'model is required', 'invalid_request_error', ''); return; }
   const skipLabel = req.headers['x-umans-proxy-skip-label'] === '1';
-  const metricId = recordAccepted('openai', resolveModelId(requestedModel), payload.stream === true);
+  const metricModel = resolveModelId(requestedModel);
+  const weight = requestWeightForModel(metricModel);
+  const metricId = recordAccepted('openai', metricModel, payload.stream === true, weight);
 
   const limit = getEffectiveConcurrency().limit;
-  if (limit !== null && activeRequests >= limit) {
+  if (!canStartWeightedRequest(weight, limit)) {
     recordQueued(metricId);
-    requestQueue.push({ res, payload, model: requestedModel, writeError: writeOpenAIError, writePassthroughError, skipLabel, req, metricId, queuedAt: Date.now() });
+    requestQueue.push({ res, payload, model: requestedModel, writeError: writeOpenAIError, writePassthroughError, skipLabel, req, metricId, queuedAt: Date.now(), weight });
     return;
   }
   activeRequests++;
-  recordStarted(metricId, 0);
+  activeRequestWeight += weight;
+  recordStarted(metricId, 0, weight);
   proxyChatRequest(res, payload, requestedModel, writeOpenAIError, writePassthroughError, skipLabel, req, metricId)
-    .finally(() => { recordCompleted(metricId, { failed: true, error: 'request ended without completion' }); activeRequests--; processQueue(); });
+    .finally(() => { recordCompleted(metricId, { failed: true, error: 'request ended without completion' }); activeRequests = Math.max(0, activeRequests - 1); activeRequestWeight = roundConcurrencyWeight(Math.max(0, activeRequestWeight - weight)); processQueue(); });
 }
 
 async function proxyAnthropicRequest(res, payload, requestedModel, writeError, writePassthroughError, skipLabel, req, metricId) {
@@ -3176,22 +3213,25 @@ async function handleAnthropicMessages(req, res) {
   if (!requestedModel) { writeAnthropicError(res, 400, 'model is required', 'invalid_request_error'); return; }
   const skipLabel = req.headers['x-umans-proxy-skip-label'] === '1';
   const isStream = anthropicPayload.stream === true;
-  const metricId = recordAccepted('anthropic', resolveModelId(requestedModel), isStream);
+  const metricModel = resolveModelId(requestedModel);
+  const weight = requestWeightForModel(metricModel);
+  const metricId = recordAccepted('anthropic', metricModel, isStream, weight);
 
   // Anthropic payloads are passed through mostly untouched, but apply the same
   // image-count cap the OpenAI path uses so UMANS never sees > MAX_IMAGES images.
   limitImagesInMessages(anthropicPayload, config.maxImages);
 
   const limit = getEffectiveConcurrency().limit;
-  if (limit !== null && activeRequests >= limit) {
+  if (!canStartWeightedRequest(weight, limit)) {
     recordQueued(metricId);
-    requestQueue.push({ res, payload: anthropicPayload, model: requestedModel, writeError: writeAnthropicError, writePassthroughError: writeAnthropicPassthroughError, skipLabel, req, format: 'anthropic', metricId, queuedAt: Date.now() });
+    requestQueue.push({ res, payload: anthropicPayload, model: requestedModel, writeError: writeAnthropicError, writePassthroughError: writeAnthropicPassthroughError, skipLabel, req, format: 'anthropic', metricId, queuedAt: Date.now(), weight });
     return;
   }
   activeRequests++;
-  recordStarted(metricId, 0);
+  activeRequestWeight += weight;
+  recordStarted(metricId, 0, weight);
   proxyAnthropicRequest(res, anthropicPayload, requestedModel, writeAnthropicError, writeAnthropicPassthroughError, skipLabel, req, metricId)
-    .finally(() => { recordCompleted(metricId, { failed: true, error: 'request ended without completion' }); activeRequests--; processQueue(); });
+    .finally(() => { recordCompleted(metricId, { failed: true, error: 'request ended without completion' }); activeRequests = Math.max(0, activeRequests - 1); activeRequestWeight = roundConcurrencyWeight(Math.max(0, activeRequestWeight - weight)); processQueue(); });
 }
 
 async function proxyChatRequest(res, payload, requestedModel, writeError, writeUpstreamError, skipLabel, req, metricId) {
@@ -3830,7 +3870,16 @@ async function handleRequest(req, res) {
       try {
         const data = await fetchConcurrency();
         const effective = getEffectiveConcurrency();
-        writeJSON(res, 200, { ...data, ...effective, active: activeRequests, queued: requestQueue.length });
+        const activeWeight = roundConcurrencyWeight(activeRequestWeight);
+        writeJSON(res, 200, {
+          ...data,
+          ...effective,
+          active: activeRequests,
+          active_weight: activeWeight,
+          queued: requestQueue.length,
+          flash_weight: FLASH_CONCURRENCY_WEIGHT,
+          remaining_weight: effective.limit === null ? null : roundConcurrencyWeight(Math.max(0, effective.limit - activeWeight)),
+        });
       } catch (e) {
         if (!res.writableEnded) writeJSON(res, 500, { error: e.message });
       }

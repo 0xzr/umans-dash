@@ -1046,8 +1046,13 @@ container.innerHTML = `<div style="width:100%;font-size:11px;white-space:nowrap"
       const conc = liveMetrics.concurrency || {};
       const tok = liveMetrics.tokens || {};
       const cache = liveMetrics.cache || {};
+      const activeWeight = req.active_weight ?? conc.active_weight ?? 0;
+      const remainingWeight = conc.remaining_weight;
+      const flashWeight = conc.flash_weight ?? 0.5;
       document.getElementById('liveActiveQueued').textContent = `${req.active || 0}/${req.queued || 0}`;
+      document.getElementById('liveActiveQueued').title = `weighted active ${activeWeight}; Flash counts as ${flashWeight}`;
       document.getElementById('liveCap').textContent = conc.limit == null ? '--' : String(conc.limit);
+      document.getElementById('liveCap').title = conc.limit == null ? 'No local concurrency cap' : `weighted cap ${conc.limit}, remaining ${remainingWeight ?? '--'}; Flash counts as ${flashWeight}`;
       document.getElementById('liveQueueDelay').textContent = `${fmtMs(req.avg_queue_delay_ms)} avg`;
       document.getElementById('liveQueueDelay').title = `max ${fmtMs(req.max_queue_delay_ms || 0)}, total queued ${req.queued_total || 0}`;
       document.getElementById('liveRequests').textContent = `${req.completed || 0}/${req.failed || 0}`;
@@ -1067,6 +1072,7 @@ container.innerHTML = `<div style="width:100%;font-size:11px;white-space:nowrap"
         status: r.status || 'active',
         durationMs: r.startedAgeMs || r.ageMs || 0,
         queuedMs: r.queuedMs || 0,
+        weight: r.weight || 1,
         tokens: {},
       }));
       const allRows = [...activeRows, ...rows].slice(0, 8);
@@ -1080,7 +1086,7 @@ container.innerHTML = `<div style="width:100%;font-size:11px;white-space:nowrap"
           const tokens = r.tokens?.total || 0;
           const statusColor = r.status === 'error' ? '#ff6b6b' : (r.status === 'queued' ? '#ffd166' : (r.status === 'active' ? '#64b5f6' : '#32CD32'));
           return `<div style="display:grid;grid-template-columns:1.1fr 0.8fr 0.7fr 0.8fr 0.8fr;gap:8px;border-top:1px solid rgba(255,255,255,0.06);padding-top:3px;margin-top:3px">
-            <span style="white-space:nowrap;overflow:hidden;text-overflow:ellipsis">${escapeHtml(r.model || '-')}</span>
+            <span style="white-space:nowrap;overflow:hidden;text-overflow:ellipsis" title="weight ${r.weight || 1}">${escapeHtml(r.model || '-')}</span>
             <span style="color:${statusColor}">${escapeHtml(r.status || '-')}</span>
             <span>${fmtMs(r.durationMs || 0)}</span>
             <span>${fmtMs(r.queuedMs || 0)}</span>
