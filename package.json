@@ -6,7 +6,8 @@
   "scripts": {
     "start": "node proxy.js",
     "dev": "node --watch proxy.js",
-    "start:bun": "bun run proxy.js"
+    "start:bun": "bun run proxy.js",
+    "test": "node test/anthropic-compat.test.js"
   },
   "keywords": [
     "umans-proxy",

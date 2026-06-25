@@ -7,6 +7,7 @@ OpenAI-compatible proxy for [UMANS AI](https://code.umans.ai). Zero external dep
 ## Features
 
 - **OpenAI-Compatible API** — Drop-in for `/v1/chat/completions` and `/v1/models`
+- **Anthropic-Compatible API** — Claude Code-compatible `/v1/messages` and generated settings for `glm52` / `kimi27`
 - **Single Account** — One UMANS account with app login for usage tracking
 - **90-Day Usage History** — View daily token usage for the last 90 days
 - **Response Caching** — LRU cache for non-streaming responses
@@ -124,6 +125,88 @@ The handoff applies to both the OpenAI (`/v1/chat/completions`) and Anthropic (`
 
 The built-in prompt instructs the handoff model to describe all visible elements, transcribe any text, and explain the context of the image.
 
+## Claude Code / Anthropic API Compatibility
+
+This fork exposes Anthropic Messages API compatibility for Claude Code at:
+
+- `POST /v1/messages`
+- `POST /messages`
+
+Point Claude Code at the proxy root, not `/v1`:
+
+```json
+{
+  "env": {
+    "ANTHROPIC_BASE_URL": "http://127.0.0.1:8084",
+    "ANTHROPIC_AUTH_TOKEN": "umans-proxy",
+    "ANTHROPIC_API_KEY": "",
+    "ANTHROPIC_DEFAULT_OPUS_MODEL": "kimi27",
+    "ANTHROPIC_DEFAULT_SONNET_MODEL": "glm52",
+    "ANTHROPIC_DEFAULT_HAIKU_MODEL": "flash",
+    "ANTHROPIC_DEFAULT_FABLE_MODEL": "glm52",
+    "CLAUDE_CODE_DISABLE_1M_CONTEXT": "true"
+  }
+}
+```
+
+If `API_KEYS` is configured, use the first configured proxy API key as
+`ANTHROPIC_AUTH_TOKEN`. If the proxy is open-access, `umans-proxy` is fine.
+
+On startup, the proxy writes Claude Code settings files to
+`~/.config/gt-claude` by default:
+
+- `umans-proxy.settings.json`
+- `umans-proxy-glm52.settings.json`
+- `umans-proxy-kimi27.settings.json`
+- `umans.settings.json`
+- `umans-glm.settings.json`
+- `umans-kimi.settings.json`
+- `glm52.settings.json`
+- `kimi27.settings.json`
+
+Force regeneration:
+
+```bash
+curl -X POST http://127.0.0.1:8084/api/claude-code/setup
+```
+
+Example:
+
+```bash
+claude --settings ~/.config/gt-claude/glm52.settings.json --model glm52 -p "hello"
+claude --settings ~/.config/gt-claude/kimi27.settings.json --model kimi27 -p "hello"
+```
+
+Gas Town can point its `umans-glm` / `umans-kimi` agent settings at those
+generated files after key rotation, while keeping direct model shortcuts usable
+for ad-hoc Claude Code calls.
+
+### Model Shortcuts
+
+The proxy resolves these aliases before forwarding to UMANS:
+
+| Shortcut | UMANS model |
+|---|---|
+| `glm52`, `glm5.2`, `glm`, `umans-glm` | `umans-glm-5.2` |
+| `kimi27`, `kimi2.7`, `kimi`, `umans-kimi` | `umans-kimi-k2.7` |
+| `flash`, `haiku`, `umans-haiku` | `umans-flash` |
+
+Add or override aliases in `.config/config.json`:
+
+```json
+{
+  "MODEL_ALIASES": {
+    "my-glm": "umans-glm-5.2"
+  }
+}
+```
+
+Or through the environment:
+
+```bash
+MODEL_ALIASES='{"my-glm":"umans-glm-5.2"}' node proxy.js
+```
+
 ## API Endpoints
 
 | Method | Path | Description |
@@ -150,6 +233,7 @@ The built-in prompt instructs the handoff model to describe all visible elements
 | `GET/POST` | `/api/bg-freegen` | FreeGen AI wallpaper generator (GET returns cached image; POST `{prompt, ratio, wait}` starts/waits for generation) |
 | `GET` | `/api/i18n` | Translation bundle for the dashboard (cached; use `?generate=1` to force) |
 | `GET` | `/api/i18n?config=1` | i18n configuration: key status and forced/fallback locale |
+| `POST` | `/api/claude-code/setup` | Regenerate Claude Code settings files for local proxy shortcuts |
 
 ## Configuration
 
@@ -174,6 +258,9 @@ The built-in prompt instructs the handoff model to describe all visible elements
 | `VISION_HANDOFF_ENABLED` | Enable image handoff for vision-incapable models | `true` |
 | `VISION_HANDOFF_MODEL` | Vision-capable model used to analyze images during handoff | `umans-kimi-k2.7` |
 | `VISION_HANDOFF_PROMPT` | Custom analysis prompt for the handoff model (empty = built-in) | — |
+| `MODEL_ALIASES` | Object or JSON string of client model aliases resolved before forwarding | built-in shortcuts |
+| `CLAUDE_CODE_SETTINGS_ENABLED` | Generate local Claude Code settings files on startup | `true` |
+| `CLAUDE_CODE_SETTINGS_DIR` | Directory for generated Claude Code settings | `~/.config/gt-claude` |
 | `wallpaperSource` | Dashboard wallpaper source: `none`, `bing`, `wallhaven`, or `freegen` | `freegen` |
 | `FREEGEN_PROMPT` | Default prompt used by FreeGen wallpaper generator | `epic cinematic landscape, mountains at sunset, vibrant colors, ultra detailed, 16:9 wallpaper` |
 | `LOCALE` | Force dashboard locale (e.g. `de`); falls back to English when no API key | — |

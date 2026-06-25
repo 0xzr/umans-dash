@@ -11,6 +11,78 @@ const API_KEY_ENV_VAR = 'UMANS_API_KEY';
 const APP_BASE = 'https://app.umans.ai';
 const MODELS_DEV_CATALOG_URL = 'https://models.dev/api.json';
 
+const DEFAULT_MODEL_ALIASES = {
+  glm: 'umans-glm-5.2',
+  glm52: 'umans-glm-5.2',
+  'glm5.2': 'umans-glm-5.2',
+  'glm-5.2': 'umans-glm-5.2',
+  'umans-glm': 'umans-glm-5.2',
+  'umans-glm52': 'umans-glm-5.2',
+  kimi: 'umans-kimi-k2.7',
+  kimi27: 'umans-kimi-k2.7',
+  'kimi2.7': 'umans-kimi-k2.7',
+  'kimi-2.7': 'umans-kimi-k2.7',
+  'umans-kimi': 'umans-kimi-k2.7',
+  'umans-kimi27': 'umans-kimi-k2.7',
+  flash: 'umans-flash',
+  haiku: 'umans-flash',
+  'umans-haiku': 'umans-flash',
+};
+
+const CLAUDE_CODE_PROFILE_DEFS = [
+  {
+    filename: 'umans.settings.json',
+    model: 'kimi27',
+    contextWindow: '262144',
+    maxTokens: '32768',
+  },
+  {
+    filename: 'umans-glm.settings.json',
+    model: 'glm52',
+    contextWindow: '405504',
+    maxTokens: '131072',
+    effort: 'max',
+  },
+  {
+    filename: 'umans-kimi.settings.json',
+    model: 'kimi27',
+    contextWindow: '262144',
+    maxTokens: '32768',
+  },
+  {
+    filename: 'umans-proxy.settings.json',
+    model: 'kimi27',
+    contextWindow: '262144',
+    maxTokens: '32768',
+  },
+  {
+    filename: 'umans-proxy-glm52.settings.json',
+    model: 'glm52',
+    contextWindow: '405504',
+    maxTokens: '131072',
+    effort: 'max',
+  },
+  {
+    filename: 'umans-proxy-kimi27.settings.json',
+    model: 'kimi27',
+    contextWindow: '262144',
+    maxTokens: '32768',
+  },
+  {
+    filename: 'glm52.settings.json',
+    model: 'glm52',
+    contextWindow: '405504',
+    maxTokens: '131072',
+    effort: 'max',
+  },
+  {
+    filename: 'kimi27.settings.json',
+    model: 'kimi27',
+    contextWindow: '262144',
+    maxTokens: '32768',
+  },
+];
+
 const FREEGEN_PROMPT_SIGNER = 'https://prompt-signer.freegen.app/api/test';
 const FREEGEN_IMAGE_GENERATOR = 'https://image-generator.freegen.app/api/test';
 const FREEGEN_WS_BRIDGE = 'wss://websocket-bridge.freegen.app/ws';
@@ -328,6 +400,47 @@ function getOrderedModelIds() {
   return ids;
 }
 
+function parseModelAliases(rawAliases) {
+  if (!rawAliases) return {};
+  if (typeof rawAliases === 'object' && !Array.isArray(rawAliases)) {
+    return Object.fromEntries(Object.entries(rawAliases)
+      .filter(([k, v]) => typeof k === 'string' && k.trim() && typeof v === 'string' && v.trim())
+      .map(([k, v]) => [k.trim(), v.trim()]));
+  }
+  if (typeof rawAliases !== 'string') return {};
+  const trimmed = rawAliases.trim();
+  if (!trimmed) return {};
+  try {
+    return parseModelAliases(JSON.parse(trimmed));
+  } catch {}
+  const out = {};
+  for (const part of trimmed.split(',')) {
+    const [k, v] = part.split('=').map(s => (s || '').trim());
+    if (k && v) out[k] = v;
+  }
+  return out;
+}
+
+function getModelAliases() {
+  return { ...DEFAULT_MODEL_ALIASES, ...(config?.modelAliases || {}) };
+}
+
+function resolveModelAlias(requestedModel) {
+  if (!requestedModel) return requestedModel;
+  const aliases = getModelAliases();
+  const seen = new Set();
+  let current = requestedModel.trim();
+  for (let i = 0; i < 8; i++) {
+    const key = current.toLowerCase();
+    if (seen.has(key)) return current;
+    seen.add(key);
+    const next = aliases[current] || aliases[key];
+    if (!next || typeof next !== 'string') return current;
+    current = next.trim();
+  }
+  return current;
+}
+
 function getEffectiveModels() {
   // Use all UMANS catalog models as the authoritative model list.
   const catalogIds = getOrderedModelIds();
@@ -336,6 +449,33 @@ function getEffectiveModels() {
   if (!disabled || disabled.length === 0) return all;
   const disabledSet = new Set(disabled);
   return all.filter(m => !disabledSet.has(m));
+}
+
+function getEffectiveModelsWithAliases() {
+  const models = getEffectiveModels();
+  const modelSet = new Set(models);
+  const disabled = new Set(config?.disabledModels || []);
+  for (const [alias, target] of Object.entries(getModelAliases())) {
+    if (!alias || disabled.has(alias)) continue;
+    const resolved = resolveModelAlias(target);
+    if (disabled.has(resolved)) continue;
+    if (modelSet.has(resolved) || models.length === 0) modelSet.add(alias);
+  }
+  return [...modelSet];
+}
+
+function getModelInfoForClientId(modelId) {
+  const resolved = resolveModelId(modelId);
+  return modelInfoMap[resolved] || modelInfoMap[modelId] || {};
+}
+
+function getDisplayNameForClientId(modelId) {
+  const resolved = resolveModelId(modelId);
+  if (modelId !== resolved) {
+    const targetName = modelDisplayNameMap[resolved] || resolved.replace(/^umans-/i, '');
+    return `${modelId} → ${targetName}`;
+  }
+  return modelDisplayNameMap[modelId] || modelId.replace(/^umans-/i, '');
 }
 
 function getAllCatalogModels() {
@@ -353,6 +493,8 @@ const OPENCODE_CONFIG_PATHS_TTL = 5 * 60 * 1000;
 let opencodeDiscoveryFailedLogged = false;
 let opencodeSetupTimeout = null;
 let opencodeSetupPending = false;
+let claudeCodeSetupTimeout = null;
+let claudeCodeSetupPending = false;
 
 // --- FreeGen background wallpaper state ---
 let freegenGenerating = false;
@@ -469,6 +611,9 @@ function loadConfig() {
   if (process.env.OVERRIDE_CONCURRENCY) rawConfig.OVERRIDE_CONCURRENCY = parseInt(process.env.OVERRIDE_CONCURRENCY);
   if (process.env.MAX_IMAGES) rawConfig.MAX_IMAGES = parseInt(process.env.MAX_IMAGES);
   if (process.env.SLEEV_ENABLED !== undefined) rawConfig.SLEEV_ENABLED = process.env.SLEEV_ENABLED !== 'false';
+  if (process.env.MODEL_ALIASES) rawConfig.MODEL_ALIASES = process.env.MODEL_ALIASES;
+  if (process.env.CLAUDE_CODE_SETTINGS_ENABLED !== undefined) rawConfig.CLAUDE_CODE_SETTINGS_ENABLED = process.env.CLAUDE_CODE_SETTINGS_ENABLED !== 'false';
+  if (process.env.CLAUDE_CODE_SETTINGS_DIR) rawConfig.CLAUDE_CODE_SETTINGS_DIR = process.env.CLAUDE_CODE_SETTINGS_DIR;
 
   const requestTimeout = parseDuration(rawConfig.REQUEST_TIMEOUT);
   if (!rawConfig.LISTEN_ADDR) throw new Error('LISTEN_ADDR cannot be empty');
@@ -507,6 +652,9 @@ function loadConfig() {
     visionHandoffModel: rawConfig.VISION_HANDOFF_MODEL || 'umans-kimi-k2.7',
     visionHandoffPrompt: rawConfig.VISION_HANDOFF_PROMPT || '',
     sleevEnabled: rawConfig.SLEEV_ENABLED === true,
+    modelAliases: parseModelAliases(rawConfig.MODEL_ALIASES),
+    claudeCodeSettingsEnabled: rawConfig.CLAUDE_CODE_SETTINGS_ENABLED !== false,
+    claudeCodeSettingsDir: rawConfig.CLAUDE_CODE_SETTINGS_DIR || path.join(os.homedir(), '.config', 'gt-claude'),
   };
 }
 
@@ -560,6 +708,9 @@ function saveConfig(cfg) {
     VISION_HANDOFF_MODEL: cfg.visionHandoffModel || 'umans-kimi-k2.7',
     VISION_HANDOFF_PROMPT: cfg.visionHandoffPrompt || '',
     SLEEV_ENABLED: cfg.sleevEnabled === true,
+    MODEL_ALIASES: cfg.modelAliases || {},
+    CLAUDE_CODE_SETTINGS_ENABLED: cfg.claudeCodeSettingsEnabled !== false,
+    CLAUDE_CODE_SETTINGS_DIR: cfg.claudeCodeSettingsDir || path.join(os.homedir(), '.config', 'gt-claude'),
   }, null, 2));
 }
 
@@ -1634,12 +1785,15 @@ function needsVisionHandoff(resolvedModel) {
 // Resolve a requested model ID to its umans- catalog ID.
 function resolveModelId(requestedModel) {
   if (!requestedModel) return requestedModel;
-  if (requestedModel.startsWith('umans-')) return requestedModel;
-  const prefixed = 'umans-' + requestedModel;
+  const aliased = resolveModelAlias(requestedModel);
+  if (aliased !== requestedModel) return resolveModelId(aliased);
+  const trimmed = requestedModel.trim();
+  if (trimmed.startsWith('umans-')) return trimmed;
+  const prefixed = 'umans-' + trimmed;
   const allModels = getEffectiveModels();
   if (allModels.includes(prefixed)) return prefixed;
-  const direct = allModels.find(m => m === requestedModel);
-  return direct || requestedModel;
+  const direct = allModels.find(m => m === trimmed);
+  return direct || trimmed;
 }
 
 // Walk a content array (OpenAI or Anthropic format) and collect image parts.
@@ -2005,7 +2159,7 @@ class UpstreamClient {
     const isStream = body && body.stream === true;
     const resp = await fetch(requestURL, {
       method: 'POST',
-      headers: this.headers(isStream),
+      headers: this.anthropicHeaders(isStream),
       body: JSON.stringify(body),
       signal: AbortSignal.timeout(this.timeout),
       agent: UPSTREAM_AGENT,
@@ -2600,7 +2754,7 @@ async function handleHealthz(req, res) {
 async function handleModels(req, res) {
   if (req.method !== 'GET') { writeOpenAIError(res, 405, 'method not allowed', 'invalid_request_error', ''); return; }
   await getCatalogData(); // ensure model catalog is loaded
-  const models = getEffectiveModels();
+  const models = getEffectiveModelsWithAliases();
   const created = Math.floor(startTime.getTime() / 1000);
   writeJSON(res, 200, {
     object: 'list',
@@ -2609,9 +2763,9 @@ async function handleModels(req, res) {
       object: 'model',
       created,
       owned_by: 'umans',
-      root: m,
+      root: resolveModelId(m),
       permission: [],
-      display_name: modelDisplayNameMap[m] || m.replace(/^umans-/i, ''),
+      display_name: getDisplayNameForClientId(m),
     }))
   });
 }
@@ -2695,6 +2849,7 @@ async function proxyAnthropicRequest(res, payload, requestedModel, writeError, w
   }
 
   const resolvedAnthropicModel = resolveModelId(requestedModel);
+  payload.model = resolvedAnthropicModel;
   await performVisionHandoff(payload, resolvedAnthropicModel, slot, sessNum, reqStart);
 
   try {
@@ -2997,7 +3152,11 @@ async function handleRequest(req, res) {
   const pathname = parsedUrl.pathname;
 
   if (config.apiKeys && config.apiKeys.length > 0 && !authorized(req)) {
-    writeOpenAIError(res, 401, 'invalid proxy api key', 'authentication_error', '');
+    if (pathname === '/v1/messages' || pathname === '/messages') {
+      writeAnthropicError(res, 401, 'invalid proxy api key', 'authentication_error');
+    } else {
+      writeOpenAIError(res, 401, 'invalid proxy api key', 'authentication_error', '');
+    }
     return;
   }
 
@@ -3047,6 +3206,21 @@ async function handleRequest(req, res) {
   }
 
   if (pathname === '/api/i18n') { await handleI18n(req, res); return; }
+  if (pathname === '/api/claude-code/setup') {
+    if (req.method !== 'POST') { writeJSON(res, 405, { error: 'method not allowed' }); return; }
+    try {
+      const files = setupClaudeCodeConfig();
+      writeJSON(res, 200, {
+        success: true,
+        files,
+        baseURL: getProxyBaseURLForClaudeCode(),
+        aliases: getModelAliases(),
+      });
+    } catch (e) {
+      writeJSON(res, 500, { success: false, error: e.message });
+    }
+    return;
+  }
 
   if (pathname === '/api/config') {
     if (req.method === 'GET') {
@@ -3068,6 +3242,9 @@ async function handleRequest(req, res) {
         visionHandoffModel: config.visionHandoffModel || 'umans-kimi-k2.7',
         visionHandoffPrompt: config.visionHandoffPrompt || '',
         sleevEnabled: config.sleevEnabled === true,
+        modelAliases: config.modelAliases || {},
+        claudeCodeSettingsEnabled: config.claudeCodeSettingsEnabled !== false,
+        claudeCodeSettingsDir: config.claudeCodeSettingsDir || path.join(os.homedir(), '.config', 'gt-claude'),
       };
       writeJSON(res, 200, safeConfig);
       return;
@@ -3093,12 +3270,16 @@ async function handleRequest(req, res) {
         if (typeof newConfig.visionHandoffModel === 'string') config.visionHandoffModel = newConfig.visionHandoffModel.trim();
         if (typeof newConfig.visionHandoffPrompt === 'string') config.visionHandoffPrompt = newConfig.visionHandoffPrompt;
         if (typeof newConfig.sleevEnabled === 'boolean') config.sleevEnabled = newConfig.sleevEnabled;
+        if (newConfig.modelAliases !== undefined) config.modelAliases = parseModelAliases(newConfig.modelAliases);
+        if (typeof newConfig.claudeCodeSettingsEnabled === 'boolean') config.claudeCodeSettingsEnabled = newConfig.claudeCodeSettingsEnabled;
+        if (typeof newConfig.claudeCodeSettingsDir === 'string' && newConfig.claudeCodeSettingsDir.trim()) config.claudeCodeSettingsDir = newConfig.claudeCodeSettingsDir.trim();
         if (Array.isArray(newConfig.keys)) {
           config.keys = newConfig.keys;
           keyPool = new KeyPool(config.keys.filter(k => k.key));
         }
         debouncedSaveConfig(config);
         debouncedSetupOpencodeConfig();
+        debouncedSetupClaudeCodeConfig();
         writeJSON(res, 200, { success: true });
       }
       catch (e) { writeJSON(res, 400, { error: e.message }); }
@@ -3114,7 +3295,7 @@ async function handleRequest(req, res) {
 
   if (pathname === '/api/models' && req.method === 'GET') {
     await getCatalogData();
-    writeJSON(res, 200, { models: getAllCatalogModels(), disabled_models: config.disabledModels || [], model_display_names: modelDisplayNameMap });
+    writeJSON(res, 200, { models: getAllCatalogModels(), client_models: getEffectiveModelsWithAliases(), model_aliases: getModelAliases(), disabled_models: config.disabledModels || [], model_display_names: modelDisplayNameMap });
     return;
   }
 
@@ -3518,6 +3699,69 @@ function debouncedSetupOpencodeConfig() {
   }, 500);
 }
 
+function getProxyBaseURLForClaudeCode() {
+  const port = parseListenPort(config.listenAddr);
+  return `http://127.0.0.1:${port}`;
+}
+
+function getProxyAuthTokenForClaudeCode() {
+  if (config.apiKeys && config.apiKeys.length > 0) return config.apiKeys[0];
+  return 'umans-proxy';
+}
+
+function buildClaudeCodeSettings(profile) {
+  const env = {
+    ANTHROPIC_BASE_URL: getProxyBaseURLForClaudeCode(),
+    ANTHROPIC_AUTH_TOKEN: getProxyAuthTokenForClaudeCode(),
+    ANTHROPIC_API_KEY: '',
+    ANTHROPIC_DEFAULT_OPUS_MODEL: 'kimi27',
+    ANTHROPIC_DEFAULT_SONNET_MODEL: 'glm52',
+    ANTHROPIC_DEFAULT_HAIKU_MODEL: 'flash',
+    ANTHROPIC_DEFAULT_FABLE_MODEL: 'glm52',
+    ANTHROPIC_MODEL_CONTEXT_WINDOW: profile.contextWindow,
+    ANTHROPIC_MODEL_MAX_TOKENS: profile.maxTokens,
+    CLAUDE_CODE_DISABLE_1M_CONTEXT: 'true',
+  };
+  if (profile.effort) env.CLAUDE_CODE_EFFORT_LEVEL = profile.effort;
+  return { env };
+}
+
+function setupClaudeCodeConfig() {
+  if (config.claudeCodeSettingsEnabled === false) {
+    console.log('[ClaudeCode] Settings generation disabled');
+    return [];
+  }
+  const dir = config.claudeCodeSettingsDir || path.join(os.homedir(), '.config', 'gt-claude');
+  if (!fs.existsSync(dir)) fs.mkdirSync(dir, { recursive: true, mode: 0o700 });
+
+  const written = [];
+  for (const profile of CLAUDE_CODE_PROFILE_DEFS) {
+    const filePath = path.join(dir, profile.filename);
+    const settings = buildClaudeCodeSettings(profile);
+    fs.writeFileSync(filePath, JSON.stringify(settings, null, 2));
+    try { fs.chmodSync(filePath, 0o600); } catch {}
+    written.push(filePath);
+  }
+  console.log(`[ClaudeCode] Wrote ${written.length} settings file(s) to ${dir}`);
+  return written;
+}
+
+function debouncedSetupClaudeCodeConfig() {
+  if (claudeCodeSetupPending) return;
+  claudeCodeSetupPending = true;
+  if (claudeCodeSetupTimeout) clearTimeout(claudeCodeSetupTimeout);
+  claudeCodeSetupTimeout = setTimeout(() => {
+    claudeCodeSetupTimeout = null;
+    try {
+      setupClaudeCodeConfig();
+    } catch (e) {
+      console.error(`[ClaudeCode] Setup error: ${e.message}`);
+    } finally {
+      claudeCodeSetupPending = false;
+    }
+  }, 500);
+}
+
 function setupOpencodeConfig() {
   const displayNames = config.modelDisplayNames || {};
   const port = parseListenPort(config.listenAddr);
@@ -3525,7 +3769,7 @@ function setupOpencodeConfig() {
   const configPaths = discoverOpencodeConfigs();
   let firstRun = false;
 
-  const fallbackModels = getEffectiveModels();
+  const fallbackModels = getEffectiveModelsWithAliases();
 
   const modelsDevCatalog = modelsDevCache || {};
 
@@ -3533,11 +3777,11 @@ function setupOpencodeConfig() {
     try {
       const models = {};
       for (const m of fallbackModels) {
-        const info = modelInfoMap[m] || {};
+        const info = getModelInfoForClientId(m);
         const caps = info.capabilities || {};
-        const displayName = displayNames[m] || modelDisplayNameMap[m] || (info.display_name ? info.display_name.replace(/^Umans\s+/i, '') : '') || m.replace(/^umans-/i, '');
+        const displayName = displayNames[m] || getDisplayNameForClientId(m) || (info.display_name ? info.display_name.replace(/^Umans\s+/i, '') : '') || m.replace(/^umans-/i, '');
 
-        const devEntry = findModelsDevEntry(modelsDevCatalog, m);
+        const devEntry = findModelsDevEntry(modelsDevCatalog, resolveModelId(m));
         const reasoningMode = resolveReasoningMode(devEntry, caps.reasoning);
 
         const entry = {
@@ -3763,6 +4007,7 @@ async function startServer(retryPort = null) {
     setTimeout(() => {
       try {
         const firstRun = setupOpencodeConfig();
+        setupClaudeCodeConfig();
         if (firstRun) {
           const dashboardUrl = `http://localhost:${port}`;
           if (process.platform === 'win32') {
