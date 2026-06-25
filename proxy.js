@@ -388,6 +388,7 @@ const proxyMetrics = {
   started: 0,
   completed: 0,
   failed: 0,
+  canceled: 0,
   queued: 0,
   totalQueueDelayMs: 0,
   maxQueueDelayMs: 0,
@@ -402,7 +403,7 @@ const RECENT_METRICS_MAX = 60;
 function modelMetrics(model) {
   const key = model || 'unknown';
   if (!proxyMetrics.byModel[key]) {
-    proxyMetrics.byModel[key] = { accepted: 0, completed: 0, failed: 0, tokens: { input: 0, output: 0, cached: 0, total: 0 } };
+    proxyMetrics.byModel[key] = { accepted: 0, completed: 0, failed: 0, canceled: 0, tokens: { input: 0, output: 0, cached: 0, total: 0 } };
   }
   return proxyMetrics.byModel[key];
 }
@@ -438,7 +439,7 @@ function removeQueuedItem(item, reason) {
   if (item.cleanup) item.cleanup();
   recordCompleted(item.metricId, {
     statusCode: 499,
-    failed: true,
+    canceled: true,
     error: reason || 'client disconnected while queued',
   });
   processQueue();
@@ -550,9 +551,13 @@ function recordCompleted(metricId, details = {}) {
   const usage = details.usage || { input: 0, output: 0, cached: 0, total: 0 };
   const model = details.model || item.model;
   const statusCode = details.statusCode || 0;
-  const failed = !!details.failed || statusCode >= 400;
+  const canceled = !!details.canceled;
+  const failed = !canceled && (!!details.failed || statusCode >= 400);
 
-  if (failed) {
+  if (canceled) {
+    proxyMetrics.canceled++;
+    modelMetrics(model).canceled++;
+  } else if (failed) {
     proxyMetrics.failed++;
     modelMetrics(model).failed++;
   } else {
@@ -569,7 +574,7 @@ function recordCompleted(metricId, details = {}) {
     model,
     format: item.format,
     stream: item.stream,
-    status: failed ? 'error' : (details.cacheHit ? 'cache-hit' : 'ok'),
+    status: canceled ? 'canceled' : (failed ? 'error' : (details.cacheHit ? 'cache-hit' : 'ok')),
     statusCode,
     durationMs,
     queuedMs: item.queuedMs || 0,
@@ -585,7 +590,8 @@ function recordCompleted(metricId, details = {}) {
 
 function metricsSnapshot() {
   const avgQueueDelayMs = proxyMetrics.started > 0 ? Math.round(proxyMetrics.totalQueueDelayMs / proxyMetrics.started) : 0;
-  const avgDurationMs = (proxyMetrics.completed + proxyMetrics.failed) > 0 ? Math.round(proxyMetrics.totalDurationMs / (proxyMetrics.completed + proxyMetrics.failed)) : 0;
+  const finishedCount = proxyMetrics.completed + proxyMetrics.failed + proxyMetrics.canceled;
+  const avgDurationMs = finishedCount > 0 ? Math.round(proxyMetrics.totalDurationMs / finishedCount) : 0;
   const queuedWeight = queuedRequestWeight();
   const oldestQueueMs = oldestQueuedMs();
   return {
@@ -595,6 +601,7 @@ function metricsSnapshot() {
       started: proxyMetrics.started,
       completed: proxyMetrics.completed,
       failed: proxyMetrics.failed,
+      canceled: proxyMetrics.canceled,
       active: activeRequests,
       active_weight: roundConcurrencyWeight(activeRequestWeight),
       queued: requestQueue.length,
