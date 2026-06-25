@@ -380,6 +380,184 @@ function writeAnthropicPassthroughError(res, statusCode, body) {
 
 let activeRequests = 0;
 let requestQueue = [];
+let metricsRequestSeq = 0;
+const proxyMetrics = {
+  startedAt: new Date().toISOString(),
+  accepted: 0,
+  started: 0,
+  completed: 0,
+  failed: 0,
+  queued: 0,
+  totalQueueDelayMs: 0,
+  maxQueueDelayMs: 0,
+  totalDurationMs: 0,
+  tokens: { input: 0, output: 0, cached: 0, total: 0 },
+  byModel: {},
+  active: new Map(),
+  recent: [],
+};
+const RECENT_METRICS_MAX = 60;
+
+function modelMetrics(model) {
+  const key = model || 'unknown';
+  if (!proxyMetrics.byModel[key]) {
+    proxyMetrics.byModel[key] = { accepted: 0, completed: 0, failed: 0, tokens: { input: 0, output: 0, cached: 0, total: 0 } };
+  }
+  return proxyMetrics.byModel[key];
+}
+
+function recordAccepted(format, model, stream) {
+  const id = ++metricsRequestSeq;
+  proxyMetrics.accepted++;
+  modelMetrics(model).accepted++;
+  proxyMetrics.active.set(id, {
+    id,
+    format,
+    model,
+    stream: !!stream,
+    acceptedAt: Date.now(),
+    startedAt: null,
+    queuedMs: 0,
+    status: 'queued',
+  });
+  return id;
+}
+
+function recordQueued(metricId) {
+  proxyMetrics.queued++;
+  const item = proxyMetrics.active.get(metricId);
+  if (item) item.status = 'queued';
+}
+
+function recordStarted(metricId, queuedMs = 0) {
+  proxyMetrics.started++;
+  proxyMetrics.totalQueueDelayMs += queuedMs;
+  proxyMetrics.maxQueueDelayMs = Math.max(proxyMetrics.maxQueueDelayMs, queuedMs);
+  const item = proxyMetrics.active.get(metricId);
+  if (item) {
+    item.startedAt = Date.now();
+    item.queuedMs = queuedMs;
+    item.status = 'active';
+  }
+}
+
+function usageFromPayload(payload) {
+  const usage = payload?.usage || {};
+  const input = usage.input_tokens ?? usage.prompt_tokens ?? 0;
+  const output = usage.output_tokens ?? usage.completion_tokens ?? 0;
+  const hasSeparateCacheTokens = usage.cache_read_input_tokens != null || usage.cache_creation_input_tokens != null;
+  let cached = 0;
+  if (hasSeparateCacheTokens) {
+    cached = (usage.cache_read_input_tokens || 0) + (usage.cache_creation_input_tokens || 0);
+  } else {
+    cached = usage.prompt_tokens_details?.cached_tokens ?? usage.tokens_cached ?? 0;
+  }
+  const total = usage.total_tokens ?? (input + output + (hasSeparateCacheTokens ? cached : 0));
+  return { input, output, cached, total };
+}
+
+function usageFromSseText(text) {
+  const total = { input: 0, output: 0, cached: 0, total: 0 };
+  let sawUsage = false;
+  let sawSeparateCacheTokens = false;
+  for (const event of parseSseEvents(text || '')) {
+    if (!event.data || event.data === '[DONE]') continue;
+    let parsed;
+    try { parsed = JSON.parse(event.data); } catch { continue; }
+    const usage = parsed.usage || parsed.message?.usage || parsed.delta?.usage;
+    if (!usage) continue;
+    sawUsage = true;
+    if (usage.cache_read_input_tokens != null || usage.cache_creation_input_tokens != null) {
+      sawSeparateCacheTokens = true;
+    }
+    const next = usageFromPayload({ usage });
+    total.input = Math.max(total.input, next.input || 0);
+    total.output = Math.max(total.output, next.output || 0);
+    total.cached = Math.max(total.cached, next.cached || 0);
+    total.total = Math.max(total.total, next.total || 0);
+  }
+  if (!sawUsage) return total;
+  const minimumTotal = total.input + total.output + (sawSeparateCacheTokens ? total.cached : 0);
+  if (total.total < minimumTotal) total.total = minimumTotal;
+  return total;
+}
+
+function addUsageTotals(target, usage) {
+  target.input += usage.input || 0;
+  target.output += usage.output || 0;
+  target.cached += usage.cached || 0;
+  target.total += usage.total || 0;
+}
+
+function recordCompleted(metricId, details = {}) {
+  const item = proxyMetrics.active.get(metricId);
+  if (!item || item.status === 'done') return;
+  const now = Date.now();
+  const durationMs = item.startedAt ? now - item.startedAt : now - item.acceptedAt;
+  const usage = details.usage || { input: 0, output: 0, cached: 0, total: 0 };
+  const model = details.model || item.model;
+  const statusCode = details.statusCode || 0;
+  const failed = !!details.failed || statusCode >= 400;
+
+  if (failed) {
+    proxyMetrics.failed++;
+    modelMetrics(model).failed++;
+  } else {
+    proxyMetrics.completed++;
+    modelMetrics(model).completed++;
+  }
+  proxyMetrics.totalDurationMs += durationMs;
+  addUsageTotals(proxyMetrics.tokens, usage);
+  addUsageTotals(modelMetrics(model).tokens, usage);
+
+  const row = {
+    id: item.id,
+    ts: new Date(now).toISOString(),
+    model,
+    format: item.format,
+    stream: item.stream,
+    status: failed ? 'error' : (details.cacheHit ? 'cache-hit' : 'ok'),
+    statusCode,
+    durationMs,
+    queuedMs: item.queuedMs || 0,
+    tokens: usage,
+    error: details.error ? String(details.error).slice(0, 160) : '',
+  };
+  proxyMetrics.recent.unshift(row);
+  proxyMetrics.recent = proxyMetrics.recent.slice(0, RECENT_METRICS_MAX);
+  item.status = 'done';
+  proxyMetrics.active.delete(metricId);
+}
+
+function metricsSnapshot() {
+  const avgQueueDelayMs = proxyMetrics.started > 0 ? Math.round(proxyMetrics.totalQueueDelayMs / proxyMetrics.started) : 0;
+  const avgDurationMs = (proxyMetrics.completed + proxyMetrics.failed) > 0 ? Math.round(proxyMetrics.totalDurationMs / (proxyMetrics.completed + proxyMetrics.failed)) : 0;
+  return {
+    started_at: proxyMetrics.startedAt,
+    requests: {
+      accepted: proxyMetrics.accepted,
+      started: proxyMetrics.started,
+      completed: proxyMetrics.completed,
+      failed: proxyMetrics.failed,
+      active: activeRequests,
+      queued: requestQueue.length,
+      queued_total: proxyMetrics.queued,
+      avg_queue_delay_ms: avgQueueDelayMs,
+      max_queue_delay_ms: proxyMetrics.maxQueueDelayMs,
+      avg_duration_ms: avgDurationMs,
+    },
+    tokens: proxyMetrics.tokens,
+    cache: { ...responseCache.stats, enabled: config?.cacheEnabled !== false },
+    concurrency: { ...getEffectiveConcurrency(), active: activeRequests, queued: requestQueue.length },
+    active: Array.from(proxyMetrics.active.values()).map(item => ({
+      ...item,
+      ageMs: Date.now() - item.acceptedAt,
+      startedAgeMs: item.startedAt ? Date.now() - item.startedAt : 0,
+    })),
+    recent: proxyMetrics.recent,
+    by_model: proxyMetrics.byModel,
+  };
+}
 
 let modelCatalogCache = null;
 let modelCatalogCacheTime = 0;
@@ -2537,6 +2715,53 @@ function pipeBodyToResponse(body, res) {
   });
 }
 
+function pipeBodyToResponseCapture(body, res) {
+  let closed = false;
+  const chunks = [];
+  const onClose = () => { closed = true; };
+  res.on('close', onClose);
+
+  function safeWrite(chunk) {
+    chunks.push(Buffer.from(chunk));
+    if (!closed) {
+      try { res.write(chunk); } catch (e) { closed = true; }
+    }
+  }
+
+  function safeEnd() {
+    if (!closed) {
+      try { res.end(); } catch (e) { /* ignore */ }
+    }
+  }
+
+  function done(resolve) {
+    safeEnd();
+    resolve(Buffer.concat(chunks).toString());
+  }
+
+  if (isNodeStream(body)) {
+    return new Promise((resolve) => {
+      body.on('data', chunk => safeWrite(chunk));
+      body.on('end', () => done(resolve));
+      body.on('error', () => done(resolve));
+    });
+  }
+
+  return new Promise((resolve) => {
+    const reader = body.getReader();
+    function pump() {
+      if (closed) { resolve(Buffer.concat(chunks).toString()); return; }
+      reader.read().then(({ done: readerDone, value }) => {
+        if (closed) { resolve(Buffer.concat(chunks).toString()); return; }
+        if (readerDone) { done(resolve); return; }
+        safeWrite(value);
+        pump();
+      }).catch(() => done(resolve));
+    }
+    pump();
+  });
+}
+
 // --- FreeGen wallpaper helpers ---
 async function fetchFreegenSigned(prompt) {
   const resp = await fetch(FREEGEN_PROMPT_SIGNER, {
@@ -2809,12 +3034,13 @@ function processQueue() {
     const item = requestQueue.shift();
     if (item.res.writableEnded) continue;
     activeRequests++;
+    recordStarted(item.metricId, Date.now() - (item.queuedAt || Date.now()));
     if (item.format === 'anthropic') {
-      proxyAnthropicRequest(item.res, item.payload, item.model, item.writeError, item.writePassthroughError, item.skipLabel, item.req)
-        .finally(() => { activeRequests--; processQueue(); });
+      proxyAnthropicRequest(item.res, item.payload, item.model, item.writeError, item.writePassthroughError, item.skipLabel, item.req, item.metricId)
+        .finally(() => { recordCompleted(item.metricId, { failed: true, error: 'request ended without completion' }); activeRequests--; processQueue(); });
     } else {
-      proxyChatRequest(item.res, item.payload, item.model, item.writeError, item.writePassthroughError, item.skipLabel, item.req)
-        .finally(() => { activeRequests--; processQueue(); });
+      proxyChatRequest(item.res, item.payload, item.model, item.writeError, item.writePassthroughError, item.skipLabel, item.req, item.metricId)
+        .finally(() => { recordCompleted(item.metricId, { failed: true, error: 'request ended without completion' }); activeRequests--; processQueue(); });
     }
   }
 }
@@ -2828,18 +3054,21 @@ async function handleChatCompletions(req, res) {
   const requestedModel = (payload.model || '').trim();
   if (!requestedModel) { writeOpenAIError(res, 400, 'model is required', 'invalid_request_error', ''); return; }
   const skipLabel = req.headers['x-umans-proxy-skip-label'] === '1';
+  const metricId = recordAccepted('openai', resolveModelId(requestedModel), payload.stream === true);
 
   const limit = getEffectiveConcurrency().limit;
   if (limit !== null && activeRequests >= limit) {
-    requestQueue.push({ res, payload, model: requestedModel, writeError: writeOpenAIError, writePassthroughError, skipLabel, req });
+    recordQueued(metricId);
+    requestQueue.push({ res, payload, model: requestedModel, writeError: writeOpenAIError, writePassthroughError, skipLabel, req, metricId, queuedAt: Date.now() });
     return;
   }
   activeRequests++;
-  proxyChatRequest(res, payload, requestedModel, writeOpenAIError, writePassthroughError, skipLabel, req)
-    .finally(() => { activeRequests--; processQueue(); });
+  recordStarted(metricId, 0);
+  proxyChatRequest(res, payload, requestedModel, writeOpenAIError, writePassthroughError, skipLabel, req, metricId)
+    .finally(() => { recordCompleted(metricId, { failed: true, error: 'request ended without completion' }); activeRequests--; processQueue(); });
 }
 
-async function proxyAnthropicRequest(res, payload, requestedModel, writeError, writePassthroughError, skipLabel, req) {
+async function proxyAnthropicRequest(res, payload, requestedModel, writeError, writePassthroughError, skipLabel, req, metricId) {
   const reqStart = Date.now();
   const isStream = payload.stream === true;
 
@@ -2853,7 +3082,7 @@ async function proxyAnthropicRequest(res, payload, requestedModel, writeError, w
   if (!slot) {
     slot = await keyPool.acquire();
   }
-  if (!slot) { writeError(res, 503, 'no healthy API keys available', 'server_error', 'no_healthy_keys'); return; }
+  if (!slot) { recordCompleted(metricId, { statusCode: 503, failed: true, error: 'no healthy API keys available' }); writeError(res, 503, 'no healthy API keys available', 'server_error', 'no_healthy_keys'); return; }
 
   let session;
   if (fingerprint != null) {
@@ -2909,6 +3138,7 @@ async function proxyAnthropicRequest(res, payload, requestedModel, writeError, w
       if (upstreamStatus === 503) {
         keyPool.markUnhealthy(slot.index, upstreamStatus);
       }
+      recordCompleted(metricId, { statusCode: upstreamStatus, failed: true, model: resolvedAnthropicModel, error: errText });
       return;
     }
 
@@ -2918,9 +3148,19 @@ async function proxyAnthropicRequest(res, payload, requestedModel, writeError, w
       'Connection': 'keep-alive',
     };
     res.writeHead(upstreamStatus, respHeaders);
-    pipeBodyToResponse(upstreamBody, res);
+    if (isStream) {
+      const bodyText = await pipeBodyToResponseCapture(upstreamBody, res);
+      recordCompleted(metricId, { statusCode: upstreamStatus, model: resolvedAnthropicModel, usage: usageFromSseText(bodyText) });
+    } else {
+      const bodyText = await readBodyText(upstreamBody);
+      let parsed = null;
+      try { parsed = JSON.parse(bodyText); } catch {}
+      res.end(bodyText);
+      recordCompleted(metricId, { statusCode: upstreamStatus, model: resolvedAnthropicModel, usage: usageFromPayload(parsed) });
+    }
   } catch (e) {
     console.log(`${reqStart} [Session#${sessNum}>${slot.name}]-[anthropic:${requestedModel}]-ERROR ${(e.message||'').substring(0,200)}`);
+    recordCompleted(metricId, { statusCode: 502, failed: true, error: e.message || 'upstream fetch failed' });
     writePassthroughError(res, 502, e.message || 'upstream fetch failed');
     keyPool.markUnhealthy(slot.index, 502);
   }
@@ -2936,6 +3176,7 @@ async function handleAnthropicMessages(req, res) {
   if (!requestedModel) { writeAnthropicError(res, 400, 'model is required', 'invalid_request_error'); return; }
   const skipLabel = req.headers['x-umans-proxy-skip-label'] === '1';
   const isStream = anthropicPayload.stream === true;
+  const metricId = recordAccepted('anthropic', resolveModelId(requestedModel), isStream);
 
   // Anthropic payloads are passed through mostly untouched, but apply the same
   // image-count cap the OpenAI path uses so UMANS never sees > MAX_IMAGES images.
@@ -2943,15 +3184,17 @@ async function handleAnthropicMessages(req, res) {
 
   const limit = getEffectiveConcurrency().limit;
   if (limit !== null && activeRequests >= limit) {
-    requestQueue.push({ res, payload: anthropicPayload, model: requestedModel, writeError: writeAnthropicError, writePassthroughError: writeAnthropicPassthroughError, skipLabel, req, format: 'anthropic' });
+    recordQueued(metricId);
+    requestQueue.push({ res, payload: anthropicPayload, model: requestedModel, writeError: writeAnthropicError, writePassthroughError: writeAnthropicPassthroughError, skipLabel, req, format: 'anthropic', metricId, queuedAt: Date.now() });
     return;
   }
   activeRequests++;
-  proxyAnthropicRequest(res, anthropicPayload, requestedModel, writeAnthropicError, writeAnthropicPassthroughError, skipLabel, req)
-    .finally(() => { activeRequests--; processQueue(); });
+  recordStarted(metricId, 0);
+  proxyAnthropicRequest(res, anthropicPayload, requestedModel, writeAnthropicError, writeAnthropicPassthroughError, skipLabel, req, metricId)
+    .finally(() => { recordCompleted(metricId, { failed: true, error: 'request ended without completion' }); activeRequests--; processQueue(); });
 }
 
-async function proxyChatRequest(res, payload, requestedModel, writeError, writeUpstreamError, skipLabel, req) {
+async function proxyChatRequest(res, payload, requestedModel, writeError, writeUpstreamError, skipLabel, req, metricId) {
   const reqStart = Date.now();
   const requestMethod = req?.method;
   const requestUrl = req ? `http://localhost${req.url}` : null;
@@ -2968,7 +3211,7 @@ async function proxyChatRequest(res, payload, requestedModel, writeError, writeU
   if (!slot) {
     slot = await keyPool.acquire();
   }
-  if (!slot) { writeError(res, 503, 'no healthy API keys available', 'server_error', 'no_healthy_keys'); return; }
+  if (!slot) { recordCompleted(metricId, { statusCode: 503, failed: true, error: 'no healthy API keys available' }); writeError(res, 503, 'no healthy API keys available', 'server_error', 'no_healthy_keys'); return; }
 
   let session;
   if (fingerprint != null) {
@@ -3010,6 +3253,7 @@ async function proxyChatRequest(res, payload, requestedModel, writeError, writeU
         if (parsed) parsed = sanitizeChatCompletionResponse(parsed);
         res.writeHead(200, { 'Content-Type': 'application/json' });
         res.end(parsed ? JSON.stringify(parsed) : cached);
+        recordCompleted(metricId, { statusCode: 200, model: resolveModelId(requestedModel), usage: usageFromPayload(parsed), cacheHit: true });
       }
       catch (e) { /* ignore */ }
       return;
@@ -3055,6 +3299,7 @@ async function proxyChatRequest(res, payload, requestedModel, writeError, writeU
     console.log(`${reqStart} [Session#${sessNum}>${slot.name}]-[${requestedModel}]-upstream:${resp.status} ct:${contentType}`);
 
     if (resp.status >= 200 && resp.status < 300) {
+      let successUsage = { input: 0, output: 0, cached: 0, total: 0 };
       try {
         if (contentType.includes('text/event-stream')) {
           // Buffer the SSE stream so we can sanitize any shell tool_calls before
@@ -3079,6 +3324,7 @@ async function proxyChatRequest(res, payload, requestedModel, writeError, writeU
               }
             } catch { /* fall through */ }
           }
+          successUsage = usageFromSseText(rawSse);
           const sanitizedSse = sanitizeSseResponse(rawSse);
           res.writeHead(resp.status, { 'Content-Type': 'text/event-stream', 'Cache-Control': 'no-cache', 'Connection': 'keep-alive' });
           try { res.end(sanitizedSse); } catch {}
@@ -3093,6 +3339,7 @@ async function proxyChatRequest(res, payload, requestedModel, writeError, writeU
           let parsed = null;
           try { parsed = JSON.parse(bodyText); } catch (e) { /* ignore */ }
           if (parsed) parsed = sanitizeChatCompletionResponse(parsed);
+          if (parsed) successUsage = usageFromPayload(parsed);
           if (requestedStream) {
             res.writeHead(resp.status, { 'Content-Type': 'text/event-stream', 'Cache-Control': 'no-cache', 'Connection': 'keep-alive' });
             res.end(parsed ? JSON.stringify(parsed) : `data: ${JSON.stringify({ object: 'chat.completion.chunk', choices: [{ index: 0, delta: { content: bodyText }, finish_reason: 'stop' }] })}\n\n`);
@@ -3107,6 +3354,7 @@ async function proxyChatRequest(res, payload, requestedModel, writeError, writeU
         }
       } catch (e) { console.error(`proxy response copy failed: ${e.message}`); }
       console.log(`${reqStart} [Session#${sessNum}>${slot.name}]-[${requestedModel}]-done:${Date.now() - reqStart}ms`);
+      recordCompleted(metricId, { statusCode: resp.status, model: resolvedModel, usage: successUsage });
       return { retry: false };
     }
 
@@ -3136,6 +3384,7 @@ async function proxyChatRequest(res, payload, requestedModel, writeError, writeU
       }).catch(e => console.error('failed to write errors.log:', e.message));
       if (isLast) {
         console.error(`${reqStart} [Session#${sessNum}>${slot.name}]-[${requestedModel}]-error:${resp.status}-FINAL`);
+        recordCompleted(metricId, { statusCode: resp.status, failed: true, model: resolvedModel, error: errorBodyStr });
         writeUpstreamError(res, resp.status, errorBodyStr);
         return { retry: false };
       }
@@ -3146,6 +3395,7 @@ async function proxyChatRequest(res, payload, requestedModel, writeError, writeU
 
     if (resp.status >= 500) keyPool.markUnhealthy(slot.index, resp.status);
     console.error(`${reqStart} [Session#${sessNum}>${slot.name}]-[${requestedModel}]-error:${resp.status}`);
+    recordCompleted(metricId, { statusCode: resp.status, failed: true, model: resolvedModel, error: errorBodyStr });
     writeUpstreamError(res, resp.status, errorBodyStr);
     return { retry: false };
   });
@@ -3535,6 +3785,11 @@ async function handleRequest(req, res) {
   if (pathname === '/api/cache') {
     if (req.method === 'GET') { writeJSON(res, 200, { ...responseCache.stats, enabled: config.cacheEnabled }); return; }
     if (req.method === 'DELETE') { responseCache.clear(); writeJSON(res, 200, { success: true, cache: responseCache.stats }); return; }
+  }
+
+  if (pathname === '/api/metrics' && req.method === 'GET') {
+    writeJSON(res, 200, metricsSnapshot());
+    return;
   }
 
   // UMANS Usage endpoints

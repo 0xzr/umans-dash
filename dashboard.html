@@ -186,6 +186,30 @@
         <div class="card" data-glass>
           <div class="glass-panel"></div>
           <div class="card-content">
+            <div class="card-header d-flex justify-content-between align-items-center">
+              <span><i class="bi bi-activity me-2"></i><span>Live Proxy</span></span>
+              <span style="font-size:11px;color:rgba(255,255,255,0.55)" id="liveMetricsUpdated">--</span>
+            </div>
+            <div class="card-body">
+              <div class="row g-2 mb-2">
+                <div class="col-4"><div class="card stat-inline-card h-100"><div class="card-content"><div class="stats-value" id="liveActiveQueued">--</div><div class="stats-label">Active / Queued</div></div></div></div>
+                <div class="col-4"><div class="card stat-inline-card h-100"><div class="card-content"><div class="stats-value" id="liveCap">--</div><div class="stats-label">Cap</div></div></div></div>
+                <div class="col-4"><div class="card stat-inline-card h-100"><div class="card-content"><div class="stats-value" id="liveQueueDelay">--</div><div class="stats-label">Queue Delay</div></div></div></div>
+              </div>
+              <div class="row g-2 mb-2">
+                <div class="col-4"><div class="card stat-inline-card h-100"><div class="card-content"><div class="stats-value" id="liveRequests">--</div><div class="stats-label">Local Requests</div></div></div></div>
+                <div class="col-4"><div class="card stat-inline-card h-100"><div class="card-content"><div class="stats-value" id="liveTokens">--</div><div class="stats-label">Local Tokens</div></div></div></div>
+                <div class="col-4"><div class="card stat-inline-card h-100"><div class="card-content"><div class="stats-value" id="liveCacheHit">--</div><div class="stats-label">Cache Hit</div></div></div></div>
+              </div>
+              <div style="font-size:11px;color:rgba(255,255,255,0.75);border-top:1px solid rgba(255,255,255,0.08);padding-top:6px" id="liveRecentRequests">
+                No local proxy requests yet.
+              </div>
+            </div>
+          </div>
+        </div>
+        <div class="card" data-glass>
+          <div class="glass-panel"></div>
+          <div class="card-content">
             <div class="card-header d-flex justify-content-between align-items-center"><span><i class="bi bi-clock-history me-2"></i><span data-i18n="section_usage_history">90-Day Usage History</span></span><span style="font-size:11px;font-weight:600;color:#fff;position:absolute;left:50%;transform:translateX(-50%)"><span id="histTotalReqs">0</span> <span style="font-weight:400;color:rgba(255,255,255,0.6)">REQUESTS</span></span><span style="font-size:11px;font-weight:400;color:rgba(255,255,255,0.6)"><span style="font-weight:600;color:#fff" id="histTotalTokens">0</span> TOKENS <span id="histCachedPct" style="font-weight:400;color:rgba(255,255,255,0.45)"></span></span></div>
             <div class="card-body p-0"><div class="history-scroll" id="usageHistoryContainer"><div style="text-align:center;padding:20px;color:rgba(255,255,255,0.3);font-size:12px" class="fw-medium">Loading...</div></div><div id="usagePagination" class="d-flex justify-content-center align-items-center py-1" style="border-top:1px solid rgba(255,255,255,0.08)"></div></div>
           </div>
@@ -420,7 +444,7 @@
       });
     }
 
-    let proxyData = null, config = {}, enabledModels = [], allModels = [], allDisplayNames = {}, blurTokensEnabled = false, editingIdx = -1, umansLoggedIn = false, umansEmail = '', umansUserId = '';
+    let proxyData = null, liveMetrics = null, config = {}, enabledModels = [], allModels = [], allDisplayNames = {}, blurTokensEnabled = false, editingIdx = -1, umansLoggedIn = false, umansEmail = '', umansUserId = '';
     let disabledModels = new Set();
     let wallpaperLoaded = false;
     const DEFAULT_FREEGEN_PROMPT = 'A breathtaking sci-fi landscape with glowing neon structures floating above a misty alien ocean, cinematic lighting, 8K, hyper-detailed, ethereal atmosphere, 16:9 wallpaper';
@@ -870,7 +894,7 @@
             pollSleevStatus();
           }
         }
-        renderModels(); renderTokenPools(); updateSsModeStatus(); updateStats(); await fetchUsage();
+        renderModels(); renderTokenPools(); updateSsModeStatus(); updateStats(); await fetchUsage(); await fetchLiveMetrics();
         setTimeout(initLiquidGlass, 50);
         setTimeout(()=>window.dispatchEvent(new Event('resize')),500);
       } catch(e) { showToast(t('toast_failed_load_config','Failed to load configuration'),'danger'); }
@@ -980,6 +1004,80 @@ container.innerHTML = `<div style="width:100%;font-size:11px;white-space:nowrap"
         document.getElementById('histTotalReqs').textContent = histReqs.toLocaleString();
         renderUsagePage();
       } catch { document.getElementById('totalTokens').textContent='--';document.getElementById('totalRequests').textContent='--';document.getElementById('cachedPct').textContent='--'; }
+    }
+
+    function fmtMs(ms) {
+      ms = Number(ms || 0);
+      if (ms < 1000) return ms + 'ms';
+      return (ms / 1000).toFixed(ms < 10000 ? 1 : 0) + 's';
+    }
+
+    function cacheHitPct(cache) {
+      const hits = cache?.hits || 0;
+      const misses = cache?.misses || 0;
+      const total = hits + misses;
+      return total > 0 ? ((hits / total) * 100).toFixed(0) + '%' : '0%';
+    }
+
+    function renderLiveMetrics() {
+      if (!liveMetrics) return;
+      const req = liveMetrics.requests || {};
+      const conc = liveMetrics.concurrency || {};
+      const tok = liveMetrics.tokens || {};
+      const cache = liveMetrics.cache || {};
+      document.getElementById('liveActiveQueued').textContent = `${req.active || 0}/${req.queued || 0}`;
+      document.getElementById('liveCap').textContent = conc.limit == null ? '--' : String(conc.limit);
+      document.getElementById('liveQueueDelay').textContent = `${fmtMs(req.avg_queue_delay_ms)} avg`;
+      document.getElementById('liveQueueDelay').title = `max ${fmtMs(req.max_queue_delay_ms || 0)}, total queued ${req.queued_total || 0}`;
+      document.getElementById('liveRequests').textContent = `${req.completed || 0}/${req.failed || 0}`;
+      document.getElementById('liveRequests').title = 'completed / failed';
+      document.getElementById('liveTokens').textContent = (tok.total || 0).toLocaleString();
+      document.getElementById('liveTokens').title = `${(tok.input || 0).toLocaleString()} input, ${(tok.output || 0).toLocaleString()} output, ${(tok.cached || 0).toLocaleString()} cached`;
+      document.getElementById('liveCacheHit').textContent = cacheHitPct(cache);
+      document.getElementById('liveCacheHit').title = `${cache.hits || 0} hits, ${cache.misses || 0} misses, ${cache.size || 0} stored`;
+      document.getElementById('liveMetricsUpdated').textContent = new Date().toLocaleTimeString();
+
+      const rows = (liveMetrics.recent || []).slice(0, 8);
+      const active = (liveMetrics.active || []).filter(r => r.status !== 'done');
+      const activeRows = active.map(r => ({
+        ts: new Date().toISOString(),
+        model: r.model,
+        format: r.format,
+        status: r.status || 'active',
+        durationMs: r.startedAgeMs || r.ageMs || 0,
+        queuedMs: r.queuedMs || 0,
+        tokens: {},
+      }));
+      const allRows = [...activeRows, ...rows].slice(0, 8);
+      const recent = document.getElementById('liveRecentRequests');
+      if (!allRows.length) {
+        recent.textContent = 'No local proxy requests yet.';
+        return;
+      }
+      recent.innerHTML = `<div style="display:grid;grid-template-columns:1.1fr 0.8fr 0.7fr 0.8fr 0.8fr;gap:8px;color:rgba(255,255,255,0.45);text-transform:uppercase;letter-spacing:0.6px;font-size:10px;margin-bottom:3px"><span>Model</span><span>Status</span><span>Latency</span><span>Queued</span><span>Tokens</span></div>` +
+        allRows.map(r => {
+          const tokens = r.tokens?.total || 0;
+          const statusColor = r.status === 'error' ? '#ff6b6b' : (r.status === 'queued' ? '#ffd166' : (r.status === 'active' ? '#64b5f6' : '#32CD32'));
+          return `<div style="display:grid;grid-template-columns:1.1fr 0.8fr 0.7fr 0.8fr 0.8fr;gap:8px;border-top:1px solid rgba(255,255,255,0.06);padding-top:3px;margin-top:3px">
+            <span style="white-space:nowrap;overflow:hidden;text-overflow:ellipsis">${escapeHtml(r.model || '-')}</span>
+            <span style="color:${statusColor}">${escapeHtml(r.status || '-')}</span>
+            <span>${fmtMs(r.durationMs || 0)}</span>
+            <span>${fmtMs(r.queuedMs || 0)}</span>
+            <span>${tokens ? tokens.toLocaleString() : '-'}</span>
+          </div>`;
+        }).join('');
+    }
+
+    async function fetchLiveMetrics() {
+      try {
+        const r = await fetch('/api/metrics');
+        if (!r.ok) throw Error();
+        liveMetrics = await r.json();
+        renderLiveMetrics();
+      } catch {
+        const updated = document.getElementById('liveMetricsUpdated');
+        if (updated) updated.textContent = 'offline';
+      }
     }
 
     function updateStats() {
@@ -1338,6 +1436,7 @@ container.innerHTML = `<div style="width:100%;font-size:11px;white-space:nowrap"
       });
       updateStatus();
       setInterval(updateStatus,15000);
+      setInterval(fetchLiveMetrics,2000);
       setInterval(fetchUsage,30000);
       setTimeout(()=>window.dispatchEvent(new Event('resize')),1000);
       setTimeout(()=>window.dispatchEvent(new Event('resize')),3000);
