@@ -2686,13 +2686,44 @@ function freegenBackgroundRefresh() {
 }
 
 // --- HTTP Handlers ---
-function authorized(req) {
+const DASHBOARD_AUTH_COOKIE = 'umans_proxy_token';
+
+function parseCookies(req) {
+  const header = req.headers.cookie || '';
+  const cookies = {};
+  for (const part of header.split(';')) {
+    const idx = part.indexOf('=');
+    if (idx < 0) continue;
+    const key = part.slice(0, idx).trim();
+    const value = part.slice(idx + 1).trim();
+    if (!key) continue;
+    cookies[key] = decodeURIComponent(value);
+  }
+  return cookies;
+}
+
+function validProxyToken(token) {
+  if (!config.apiKeys || config.apiKeys.length === 0) return true;
+  return !!token && config.apiKeys.includes(token);
+}
+
+function dashboardAuthCookie(token) {
+  return `${DASHBOARD_AUTH_COOKIE}=${encodeURIComponent(token)}; Path=/; Max-Age=2592000; HttpOnly; SameSite=Lax`;
+}
+
+function authorized(req, parsedUrl = null) {
   if (!config.apiKeys || config.apiKeys.length === 0) return true;
   const xApiKey = (req.headers['x-api-key'] || '').trim();
-  if (xApiKey && config.apiKeys.includes(xApiKey)) return true;
+  if (validProxyToken(xApiKey)) return true;
   const authorization = (req.headers['authorization'] || '').trim();
-  if (!authorization.startsWith('Bearer ')) return false;
-  return config.apiKeys.includes(authorization.substring(7).trim());
+  if (authorization.startsWith('Bearer ') && validProxyToken(authorization.substring(7).trim())) return true;
+  const cookies = parseCookies(req);
+  if (validProxyToken(cookies[DASHBOARD_AUTH_COOKIE])) return true;
+  if (parsedUrl) {
+    const queryToken = parsedUrl.searchParams.get('token') || parsedUrl.searchParams.get('api_key');
+    if (validProxyToken(queryToken)) return true;
+  }
+  return false;
 }
 
 function readBody(req) {
@@ -3151,7 +3182,21 @@ async function handleRequest(req, res) {
   const parsedUrl = new URL(req.url, 'http://localhost');
   const pathname = parsedUrl.pathname;
 
-  if (config.apiKeys && config.apiKeys.length > 0 && !authorized(req)) {
+  const queryToken = parsedUrl.searchParams.get('token') || parsedUrl.searchParams.get('api_key');
+  if (queryToken && validProxyToken(queryToken) && (pathname === '/dashboard' || pathname === '/')) {
+    parsedUrl.searchParams.delete('token');
+    parsedUrl.searchParams.delete('api_key');
+    const location = pathname === '/' ? '/dashboard' : `${pathname}${parsedUrl.search}`;
+    res.writeHead(302, {
+      'Location': location,
+      'Set-Cookie': dashboardAuthCookie(queryToken),
+      'Cache-Control': 'no-store',
+    });
+    res.end();
+    return;
+  }
+
+  if (config.apiKeys && config.apiKeys.length > 0 && !authorized(req, parsedUrl)) {
     if (pathname === '/v1/messages' || pathname === '/messages') {
       writeAnthropicError(res, 401, 'invalid proxy api key', 'authentication_error');
     } else {
